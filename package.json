@@ -28,7 +28,8 @@
   "scripts": {
     "prepare": "tsc -p tsconfig.json",
     "build": "tsc -p tsconfig.json",
-    "clean": "rm -rf lib"
+    "clean": "rm -rf lib",
+    "dsh:install": "node scripts/dsh-install.mjs"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",

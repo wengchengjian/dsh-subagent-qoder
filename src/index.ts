@@ -6,6 +6,10 @@
  * @module dsh-subagent-qoder
  */
 
+import { spawnSync } from 'node:child_process'
+import { existsSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
@@ -80,7 +84,7 @@ export interface Config {
 export const Config: z<Config> = z.object({
   providerName: z.string().min(1).default(DEFAULT_PROVIDER_NAME),
   model: z.string().min(1),
-  authMode: z.union([...QODER_AUTH_MODES]).default('env'),
+  authMode: z.union([...QODER_AUTH_MODES]).default('qodercli'),
   authEnvVar: z.string().min(1).default(DEFAULT_ACCESS_TOKEN_ENV_VAR),
   env: z.dict(z.string()).default({}),
   pathToQoderCLIExecutable: z.string().min(1),
@@ -96,6 +100,45 @@ function buildAuth(config: ResolvedConfig): AuthOptions {
   return config.authMode === 'qodercli'
     ? qodercliAuth()
     : accessTokenFromEnv(config.authEnvVar)
+}
+
+/** Environment override for the CLI location, so a deployment needs no config row. */
+const CLI_PATH_ENV_VAR = 'QODER_CLI_PATH'
+
+function executableOnPath(names: readonly string[]): string | undefined {
+  const probe = process.platform === 'win32' ? 'where' : 'which'
+  for (const name of names) {
+    const result = spawnSync(probe, [name], { encoding: 'utf8' })
+    if (result.status !== 0) continue
+    const found = result.stdout.split(/\r?\n/)[0]?.trim()
+    if (found !== undefined && existsSync(found)) return found
+  }
+  return undefined
+}
+
+/**
+ * Locate a usable CLI so the common install needs no `pathToQoderCLIExecutable`.
+ * Required because this provider must use the process transport, and the SDK's
+ * default package runtime is the global-brand worker, which cannot authenticate
+ * against a CN-only login.
+ */
+export function discoverQoderCLI(): string | undefined {
+  const fromEnv = process.env[CLI_PATH_ENV_VAR]?.trim()
+  if (fromEnv !== undefined && fromEnv.length > 0 && existsSync(fromEnv)) return fromEnv
+  const onPath = executableOnPath(['qoderclicn', 'qodercli'])
+  if (onPath !== undefined) return onPath
+  const suffix = process.platform === 'win32' ? '.exe' : ''
+  const home = homedir()
+  for (const dir of [
+    join(home, '.qoder-cn', 'bin', 'qoderclicn'),
+    join(home, '.qoder', 'bin', 'qodercli'),
+  ]) {
+    for (const base of ['qoderclicn', 'qodercli']) {
+      const candidate = join(dir, `${base}${suffix}`)
+      if (existsSync(candidate)) return candidate
+    }
+  }
+  return undefined
 }
 
 class QoderProvider implements SubagentProvider {
@@ -159,17 +202,24 @@ class QoderProvider implements SubagentProvider {
  * @param config - registry name, optional model, auth, permission mode, child environment, and disposal grace.
  */
 export function apply(ctx: Context, config: Config): void {
+  const cliPath = config.pathToQoderCLIExecutable ?? discoverQoderCLI()
   const resolved: ResolvedConfig = {
     providerName: config.providerName ?? DEFAULT_PROVIDER_NAME,
     ...config.model === undefined ? {} : { model: config.model },
-    authMode: config.authMode ?? 'env',
+    authMode: config.authMode ?? 'qodercli',
     authEnvVar: config.authEnvVar ?? DEFAULT_ACCESS_TOKEN_ENV_VAR,
     env: config.env as Record<string, string>,
-    ...config.pathToQoderCLIExecutable === undefined
-      ? {}
-      : { pathToQoderCLIExecutable: config.pathToQoderCLIExecutable },
+    pathToQoderCLIExecutable: cliPath,
     permissionMode: config.permissionMode ?? DEFAULT_QODER_PERMISSION_MODE,
     disposeGraceMs: config.disposeGraceMs as number,
+  }
+  if (cliPath === undefined) {
+    ctx.logger.warn(
+      'subagent-qoder: no qodercli executable found via QODER_CLI_PATH, PATH, or the'
+      + ' default ~/.qoder-cn/bin/qoderclicn and ~/.qoder/bin/qodercli locations. The'
+      + ' process transport needs one, so delegations will fail; set'
+      + ' pathToQoderCLIExecutable on the provider row.',
+    )
   }
   assertPositiveFinite(
     'subagent-qoder',

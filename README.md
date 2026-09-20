@@ -10,30 +10,35 @@ Mount it when a delegation should run as a genuine Qoder CLI session with isolat
 
 ## Install
 
-Add the Bundle to a Profile, then restart that Profile. Installation registers only the **dormant** provider and starts no `qodercli` process; the model cannot reach it until you compose a delegation tool row (below).
+One command, from a built checkout of this repository:
 
 ```sh
-# from a local checkout (relative specs are anchored to the invoking directory)
-dsh plugin --profile <name> add ../dsh-subagent-qoder
-dsh --profile <name>
+npm install && npm run build
+node scripts/dsh-install.mjs <profile>     # or: npm run dsh:install -- <profile>
 ```
 
-If pnpm reports `ERR_PNPM_IGNORED_BUILDS` for `@qoder-ai/qoder-agent-sdk`, set its `allowBuilds` key to `true` in the Profile's `pnpm-workspace.yaml` (pnpm writes the placeholder for you) and re-run — see [Verified install gotchas](#verified-install-gotchas).
+The script initializes a missing Profile from the `headless` template (a bare `dsh plugin add` on an unknown name seeds only `dsh-base`, whose closure lacks the subagent seam and delegation tool this Bundle inserts a row for), allows the Qoder SDK's build script past pnpm's gate, installs the Bundle, and prints a verification command. It is idempotent; restart the Profile afterwards, since bundle membership is decided at start.
 
-Installing controls Host availability, not model permission.
+To do it by hand instead:
+
+```sh
+dsh plugin --profile <name> add ../dsh-subagent-qoder
+```
+
+If pnpm reports `ERR_PNPM_IGNORED_BUILDS` for `@qoder-ai/qoder-agent-sdk`, set its `allowBuilds` key to `true` in that Profile's `pnpm-workspace.yaml` (pnpm writes the placeholder) and re-run — see [Verified install gotchas](#verified-install-gotchas). Installing controls Host availability, not model permission.
 
 ## Configure the provider
 
-The provider row is registered by `cordis.patch.yml`. Add it directly to the Profile's `cordis.patch.yml`, or leave the defaults and only compose the tool row.
+**Zero configuration is required.** The Bundle's own `cordis.patch.yml` registers the dormant provider *and* inserts the `subagent_qoder` tool row, and the provider discovers the `qodercli` executable by itself (`QODER_CLI_PATH` → `PATH` → `~/.qoder-cn/bin/qoderclicn` → `~/.qoder/bin/qodercli`). Set any of these in a provider row on the Profile's `cordis.patch.yml` only to override a default:
 
 | Field | Default | Meaning |
 |---|---|---|
 | `providerName` | `qoder` | Registry name on `ctx.subagents`; each mounted instance needs a unique value |
 | `model` | native Qoder settings | Optional model fixed for every run from this instance |
-| `authMode` | `env` | `env` reads a personal access token from `authEnvVar`; `qodercli` reuses local `qodercli login` state |
+| `authMode` | `qodercli` | `qodercli` reuses the local `qodercli login`; `env` reads a personal access token from `authEnvVar` (use this for CI/headless hosts) |
 | `authEnvVar` | `QODER_PERSONAL_ACCESS_TOKEN` | Token variable when `authMode: env` |
 | `env` | `{}` | Child environment layered over the credential-scrubbed parent environment |
-| `pathToQoderCLIExecutable` | resolve from `PATH` | Optional absolute path to `qoderclicn` / `qodercli` |
+| `pathToQoderCLIExecutable` | auto-discovered | Absolute path override; see the discovery order above |
 | `permissionMode` | `yolo` | Non-interactive policy fixed for every run from this instance |
 | `disposeGraceMs` | `3000` | Grace between managed-range termination tiers |
 
@@ -54,51 +59,47 @@ The provider row is registered by `cordis.patch.yml`. Add it directly to the Pro
 
 Credential-shaped ambient variables are removed before the `env` overlay, so a token intended for the child must be supplied via `authMode: env` or placed explicitly in `env`.
 
-## Expose the delegation tool
+## The delegation tool
 
-The bundle's own `cordis.patch.yml` already registers the **dormant provider** row (`subagent-qoder`), so what you add to your Profile is the delegation **tool** row. Each delegation tool row names one provider and needs its own `toolName`, so the model sees a static tool rather than a dynamic provider selector. For `backgroundMode: one-shot` (a call returning a parent-owned Job id), the Profile also needs the shared Jobs registry and its controls — the base host and full presets usually already provide them.
-
-Append the rows you are missing to your Profile's `cordis.patch.yml` (`$DSH_HOME/profiles/<name>/cordis.patch.yml`), then restart the Profile:
+The Bundle's `cordis.patch.yml` inserts the model-facing row itself, so after installing there is nothing to compose — the tool is named `subagent_qoder`, and it accepts only `{ description, prompt, run_in_background }`. The model cannot choose the provider's model, permission mode, or workspace; those are fixed by the provider row. Each delegation row names one provider and needs its own `toolName`, which is why a second, differently-privileged instance is a second pair of rows rather than a call argument:
 
 ```yaml
-# --- provider row: normally contributed by the installed bundle's own patch ---
+# Tighten the default, opt out, or add a second instance.
 - id: subagent-qoder
-  name: 'dsh-subagent-qoder'
   config:
-    providerName: qoder
-    authMode: env
-    # Opt in to a tighter policy than this provider's `yolo` default:
-    permissionMode: acceptEdits
-    # pathToQoderCLIExecutable: 'C:/Users/you/.qoder-cn/bin/qoderclicn/qoderclicn.exe'
+    permissionMode: acceptEdits          # opt in to a tighter policy than `yolo`
 
-# --- jobs registry + controls (needed only for run_in_background: true) ------
-- id: jobs
-  name: '@deepseek-ai/dsh-jobs-local'
-- id: tool-jobs
-  name: '@deepseek-ai/dsh-tool-jobs'
-
-# --- the model-facing delegation tool ---------------------------------------
 - id: tool-subagent-qoder
-  name: '@deepseek-ai/dsh-tool-subagent'
-  config:
-    provider: qoder
-    toolName: subagent_qoder
-    backgroundMode: one-shot
-    maxDepth: provider-managed
+  disable: true                          # hide subagent_qoder from this Profile
+
+- insert:
+    - id: subagent-qoder-safe
+      name: 'dsh-subagent-qoder'
+      config:
+        providerName: qoder-safe
+        permissionMode: acceptEdits
+- insert:
+    - id: tool-subagent-qoder-safe
+      name: '@deepseek-ai/dsh-tool-subagent'
+      config:
+        provider: qoder-safe
+        toolName: subagent_qoder_safe
+        backgroundMode: one-shot
+        maxDepth: provider-managed
 ```
 
-**Agent preset:** the `@deepseek-ai/dsh-tool-subagent` row above exposes `subagent_qoder` to any agent composed from your Profile's rows. If a session is built from an Agent Preset instead, copy the preset and add a matching `@deepseek-ai/dsh-tool-subagent` tool entry (or flip its `disabled: true` to `false`); presets ship the row disabled so installing the Bundle alone never changes existing agents' tool surface.
+The inserted row requires `@deepseek-ai/dsh-tool-subagent`, plus `@deepseek-ai/dsh-jobs-local` and `@deepseek-ai/dsh-tool-jobs` for `run_in_background`, to be in the Profile's closure. The `headless` and `web` templates already carry all three; a bare `dsh-base` Profile does not, which is why the installer initializes missing Profiles from `headless`.
 
 `maxDepth: provider-managed` is **required**, not cosmetic: this provider advertises no `depthLimit` capability, and omitting the field fails the whole Profile at boot with `tool-subagent: provider "qoder" cannot enforce maxDepth (no depthLimit capability)`. The check runs when the provider registers, so it is not visible to a unit-level `provider.start()` test — only to a real boot.
 
-A foreground call returns the final Qoder answer or an error with the stop reason and a safe diagnostic. A background call (`run_in_background: true`) returns a parent-owned Job id for `job_output` / `job_kill`.
+A foreground call returns the final Qoder answer or an error with the stop reason and a safe diagnostic. A background call returns a parent-owned Job id for `job_output` / `job_kill`.
 
 ## Authentication
 
 `query()` requires explicit auth for a direct session.
 
-- **Recommended (headless / CI):** export a personal access token as `QODER_PERSONAL_ACCESS_TOKEN` (or a custom `authEnvVar`). The provider resolves it with `accessTokenFromEnv()`.
-- **Local reuse:** set `authMode: qodercli` to reuse an interactive `qodercli login` on the same machine. Not for shared infrastructure.
+- **Local reuse (default):** `authMode: qodercli` reuses an interactive `qodercli login` on the same machine, which is why the zero-config path works on a developer workstation. Not for shared infrastructure.
+- **Headless / CI:** set `authMode: env` and export a personal access token as `QODER_PERSONAL_ACCESS_TOKEN` (or a custom `authEnvVar`); the provider resolves it with `accessTokenFromEnv()`.
 
 ## Transport and brand (important)
 
@@ -107,9 +108,9 @@ The provider forces `transport: ProcessTransport.default` in `run.ts`. This is r
 1. dsh can only place the child under its subprocess owner through the SDK's `spawnQoderCLIProcess` hook, which fires **only** on the process transport. The SDK's installed default is the `worker` transport (runtime in a Node worker thread), where the hook never runs and dsh cannot terminate the child.
 2. The bundled worker runtime is the **global** brand (`qodercli`); on a machine logged in only to the **CN** CLI (`qoderclicn`), `qodercliAuth()` against that runtime fails with `No qodercli login found`. Routing through the process transport to the CN executable uses that executable's own native login.
 
-Therefore set `pathToQoderCLIExecutable` to the matching executable for your deployment. On Windows CN that is e.g. `C:/Users/<you>/.qoder-cn/bin/qoderclicn/qoderclicn.exe`; omit it only if the correct-brand CLI is already first on `PATH`.
+The provider therefore resolves a CLI executable itself — `QODER_CLI_PATH`, then `qoderclicn`/`qodercli` on `PATH`, then `~/.qoder-cn/bin/qoderclicn` and `~/.qoder/bin/qodercli`. Override with `pathToQoderCLIExecutable` when the CLI lives elsewhere; if nothing is found the provider logs the search order at Profile start rather than failing silently on the first delegation.
 
-A standalone smoke test in [`smoke/`](smoke/) exercises exactly this path with no dsh packages: `cd smoke && npm install && node smoke.mjs` (add `pathToQoderCLIExecutable` as in the probe to run against the CN CLI).
+A standalone smoke test in [`smoke/`](smoke/) exercises the Qoder-SDK path with no dsh packages: `cd smoke && npm install && QODER_CLI_PATH=<cli> node smoke.mjs`.
 
 ## Build
 
@@ -159,17 +160,19 @@ The last row closes what a Profile boot cannot show: the `tool_call` event prove
 `job_kill` was not exercised. Note also that the parent's own `thinking` events appear in the parent stream while the child's reasoning never does — the isolation direction is as designed.
 
 | `yolo` default grants write | Provider row with `permissionMode` **omitted**, delegation asked to create `YOLO_PROOF.txt` containing `WRITE_OK` | `tool_result` reported the path; **on disk** the file existed, 8 bytes, content `WRITE_OK` (the parent then re-read it with its own `read` tool). A restrictive default would have denied the write |
+| **One-command, zero-config** | `node scripts/dsh-install.mjs <new-profile>` only; provider row carries **no** config, so the CLI path is auto-discovered and `authMode` defaults to `qodercli` | `--dump-config` composed both rows from the Bundle patch; a delegation created `ONECLICK.txt` and the bytes (`ZERO_CONFIG`) were confirmed on disk |
 
 ### Verified install gotchas
 
 1. **Requires `dsh >= 0.1.6-alpha.2`.** The `0.1.5-rc.x` line has no `out-of-process` module, so `settleRunResult`, `subprocessRunHandle`, `resolveChildCwd`, `NO_START_CAPABILITIES` and `assertPositiveFinite` are not exported and this provider cannot build. Note that `@deepseek-ai/dsh-*` publish under `latest` an old `0.0.1-rc.1`; the usable train is the `alpha` dist-tag.
-2. **pnpm blocks the Qoder SDK build script.** `dsh plugin add` fails with `ERR_PNPM_IGNORED_BUILDS: @qoder-ai/qoder-agent-sdk`. pnpm writes the key for you — set it in the Profile's `pnpm-workspace.yaml` and re-run:
+2. **pnpm blocks the Qoder SDK build script.** A bare `dsh plugin add` fails with `ERR_PNPM_IGNORED_BUILDS: @qoder-ai/qoder-agent-sdk`. `scripts/dsh-install.mjs` sets the allowance for you; by hand, add it to the Profile's `pnpm-workspace.yaml` (pnpm writes the placeholder to fill in) and re-run:
    ```yaml
    allowBuilds:
      '@qoder-ai/qoder-agent-sdk': true
    ```
 3. **Check the bundle stack after a failed install.** `dsh plugin add` reconciles `dsh.profile.bundles` on success, and a clean `file:` install does join it. But if the run fails partway (e.g. the build-script gate above), the dependency can land in `dependencies` without joining the bundle list — re-run the add after fixing, or add the name to `dsh.profile.bundles` yourself, then restart the Profile.
-4. **`pathToQoderCLIExecutable` is effectively required.** The SDK's default package runtime is `Worker` and its postinstall skips the bundled CLI binary ("Set `QODER_INSTALL_BUNDLED_CLI=1` to install the process fallback as well"). Since this provider must use the process transport, point it at the CLI — and on a CN machine it must be the **CN** executable, because the worker runtime is the global brand and reports `No qodercli login found`.
+4. **A missing Profile must come from a template that has the seam.** `dsh plugin add` on an unknown name initializes it with `dsh-base` alone, whose closure lacks `@deepseek-ai/dsh-tool-subagent`, so the Bundle's inserted tool row cannot resolve. The installer initializes from `headless` instead; installing into an existing `web`/`desktop`-style Profile needs no such care as long as that Profile already carries the seam.
+5. **The process transport needs a discoverable CLI.** The SDK's default package runtime is `Worker`, and its postinstall skips the bundled CLI binary ("Set `QODER_INSTALL_BUNDLED_CLI=1` to install the process fallback as well"). Discovery covers `QODER_CLI_PATH`, `PATH`, and the default `~/.qoder-cn/bin/qoderclicn` / `~/.qoder/bin/qodercli`; on a CN machine the discovered executable must be the **CN** one, because the global-brand worker reports `No qodercli login found`.
 
 ### Deviation from the Claude Code provider
 

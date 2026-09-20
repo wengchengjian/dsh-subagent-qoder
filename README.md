@@ -144,6 +144,9 @@ All of the following was run on a real machine (Windows, `dsh 0.1.6-alpha.2`, Qo
 | Patch composition | `dsh --profile <p> --dump-config` | provider row appears with provenance `# == dsh-subagent-qoder` |
 | Plugin contract | `import('dsh-subagent-qoder')` in the profile | `name=subagent-qoder`, `inject=["subagents","subprocess"]`, `apply`/`Config` present |
 | Delegation end-to-end | `provider.start()` with real `settleRunResult`/`subprocessRunHandle`/`resolveChildCwd` + a `SubprocessHandle` shim | `stopReason=completed`, `output=[{type:'text',text:'QODER_OK'}]`, `localAgent=undefined` |
+| **Full parent-model path** | `dsh --profile <p> --json "<ask it to call subagent_qoder>"` with the outbound proxy set | `tool_call tool=subagent_qoder` → `tool_result status=completed result="QODER_E2E_OK"` → `turn_end kind=completed`, `final="QODER_E2E_OK"`, 12608 in / 86 out tokens |
+
+The last row closes what a Profile boot cannot show: the `tool_call` event proves the delegation tool reached the parent model's tool list and the model chose to invoke it, and the `tool_result` is the child Qoder session's final text propagated back into the parent's answer.
 
 ### Verified install gotchas
 
@@ -160,6 +163,8 @@ All of the following was run on a real machine (Windows, `dsh 0.1.6-alpha.2`, Qo
 
 `query()` in the Qoder SDK starts its transport **lazily**: nothing calls `spawnQoderCLIProcess` until the session is driven. `run.ts` therefore awaits `Query.initializationResult()` before requiring the managed child handle. Without this, publication fails with `SDK did not publish a controllable qodercli process`. The provider also adds `auth` (Qoder requires it for direct `query()` sessions) and omits the SDK-absent `onUserDialog` / `supportedDialogKinds` options.
 
-### Still unverified
+### Parent-model reachability
 
-The full parent-model path — a dsh Agent actually calling the `subagent_qoder` tool — has not been exercised: the Profile booted and reached turn 1, but the parent model request timed out on this machine, so the model never answered. A successful boot proves the tool row **registered** and passed `dsh-tool-subagent`'s provider-capability assertion; it does **not** prove the tool reached the model's tool list, because a timed-out turn persists no request payload (`session.v3.jsonl` holds only the session header) and so leaves nothing to inspect. Treat tool visibility to the model, and the delegation decision itself, as untested until a turn with a responding parent model completes.
+Whether a delegation turn completes depends entirely on the parent side being able to reach its own configured provider — nothing this plugin controls. On the machine above, the globally active provider pointed at a host reachable only through a local HTTP proxy: a bare run stalled in step 1 with `inputTokens: 0` and `TIMEOUT`, while `HTTP_PROXY`/`HTTPS_PROXY` pointing at the proxy produced the successful turn recorded above. dsh resolves the outbound proxy from the launch environment before any entry mounts, so exporting those variables is enough; a provider whose endpoint is directly reachable needs no such setting.
+
+A stalled `step_end` with zero tokens is therefore a parent-model symptom, not a subagent failure — check the provider endpoint before suspecting this Bundle.

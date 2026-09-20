@@ -162,4 +162,4 @@ All of the following was run on a real machine (Windows, `dsh 0.1.6-alpha.2`, Qo
 
 ### Still unverified
 
-The full parent-model path — a dsh Agent actually calling the `subagent_qoder` tool — has not been exercised: it needs a bootable Profile with `@deepseek-ai/dsh-tool-subagent` (+ Jobs rows) composed into the session's preset, plus provider credentials for the parent model. Everything below that seam is verified above.
+The full parent-model path — a dsh Agent actually calling the `subagent_qoder` tool — has not been exercised: the Profile booted and reached turn 1, but the parent model request timed out on this machine, so the model never answered. A successful boot proves the tool row **registered** and passed `dsh-tool-subagent`'s provider-capability assertion; it does **not** prove the tool reached the model's tool list, because a timed-out turn persists no request payload (`session.v3.jsonl` holds only the session header) and so leaves nothing to inspect. Treat tool visibility to the model, and the delegation decision itself, as untested until a turn with a responding parent model completes.

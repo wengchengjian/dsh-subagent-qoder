@@ -1,0 +1,8 @@
+{
+  "name": "dsh-subagent-qoder-smoke",
+  "private": true,
+  "type": "module",
+  "description": "Standalone smoke test proving the Qoder SDK query→result path used by dsh-subagent-qoder/run.ts",
+  "scripts": { "smoke": "node smoke.mjs" },
+  "dependencies": { "@qoder-ai/qoder-agent-sdk": "^1.0.45" }
+}

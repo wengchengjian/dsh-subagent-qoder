@@ -1,0 +1,8 @@
+# This optional Profile layer registers the dormant Qoder provider. It starts
+# no qodercli process on its own. Agent presets separately decide whether a
+# session receives the delegation tool; expose it with a `@deepseek-ai/dsh-tool-subagent`
+# row (provider: qoder, toolName: subagent_qoder) composed into the preset.
+
+- insert:
+    - id: subagent-qoder
+      name: 'dsh-subagent-qoder'

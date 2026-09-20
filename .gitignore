@@ -1,0 +1,4 @@
+lib/
+node_modules/
+*.tsbuildinfo
+smoke/node_modules/

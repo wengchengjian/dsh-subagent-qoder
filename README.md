@@ -148,6 +148,10 @@ All of the following was run on a real machine (Windows, `dsh 0.1.6-alpha.2`, Qo
 
 The last row closes what a Profile boot cannot show: the `tool_call` event proves the delegation tool reached the parent model's tool list and the model chose to invoke it, and the `tool_result` is the child Qoder session's final text propagated back into the parent's answer.
 
+| Background / Job path | `subagent_qoder` with `run_in_background: true`, then `job_output` | first `tool_result` = `started background subagent job subagent-1`; then `job_output {job_id:"subagent-1", wait:true}` → `QODER_BG_OK\n[status: completed]`; `final = QODER_BG_OK` |
+
+`job_kill` was not exercised. Note also that the parent's own `thinking` events appear in the parent stream while the child's reasoning never does — the isolation direction is as designed.
+
 ### Verified install gotchas
 
 1. **Requires `dsh >= 0.1.6-alpha.2`.** The `0.1.5-rc.x` line has no `out-of-process` module, so `settleRunResult`, `subprocessRunHandle`, `resolveChildCwd`, `NO_START_CAPABILITIES` and `assertPositiveFinite` are not exported and this provider cannot build. Note that `@deepseek-ai/dsh-*` publish under `latest` an old `0.0.1-rc.1`; the usable train is the `alpha` dist-tag.

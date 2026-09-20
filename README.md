@@ -49,9 +49,12 @@ Credential-shaped ambient variables are removed before the `env` overlay, so a t
 
 ## Expose the delegation tool
 
-Each delegation tool row names one provider and needs its own `toolName`, so the model sees a static tool rather than a dynamic provider selector.
+The bundle's own `cordis.patch.yml` already registers the **dormant provider** row (`subagent-qoder`), so what you add to your Profile is the delegation **tool** row. Each delegation tool row names one provider and needs its own `toolName`, so the model sees a static tool rather than a dynamic provider selector. For `backgroundMode: one-shot` (a call returning a parent-owned Job id), the Profile also needs the shared Jobs registry and its controls — the base host and full presets usually already provide them.
+
+Append the rows you are missing to your Profile's `cordis.patch.yml` (`$DSH_HOME/profiles/<name>/cordis.patch.yml`), then restart the Profile:
 
 ```yaml
+# --- provider row: normally contributed by the installed bundle's own patch ---
 - id: subagent-qoder
   name: 'dsh-subagent-qoder'
   config:
@@ -60,6 +63,13 @@ Each delegation tool row names one provider and needs its own `toolName`, so the
     permissionMode: dontAsk
     # pathToQoderCLIExecutable: 'C:/Users/you/.qoder-cn/bin/qoderclicn/qoderclicn.exe'
 
+# --- jobs registry + controls (needed only for run_in_background: true) ------
+- id: jobs
+  name: '@deepseek-ai/dsh-jobs-local'
+- id: tool-jobs
+  name: '@deepseek-ai/dsh-tool-jobs'
+
+# --- the model-facing delegation tool ---------------------------------------
 - id: tool-subagent-qoder
   name: '@deepseek-ai/dsh-tool-subagent'
   config:
@@ -68,6 +78,8 @@ Each delegation tool row names one provider and needs its own `toolName`, so the
     backgroundMode: one-shot
     maxDepth: provider-managed
 ```
+
+**Agent preset:** the `@deepseek-ai/dsh-tool-subagent` row above exposes `subagent_qoder` to any agent composed from your Profile's rows. If a session is built from an Agent Preset instead, copy the preset and add a matching `@deepseek-ai/dsh-tool-subagent` tool entry (or flip its `disabled: true` to `false`); presets ship the row disabled so installing the Bundle alone never changes existing agents' tool surface.
 
 A foreground call returns the final Qoder answer or an error with the stop reason and a safe diagnostic. A background call (`run_in_background: true`) returns a parent-owned Job id for `job_output` / `job_kill`.
 

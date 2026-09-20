@@ -53,12 +53,28 @@ Defaults are chosen so that **installing is the whole setup** — an empty provi
 | Value | Flags | Behavior |
 |---|---|---|
 | `yolo` **(default)** | `--yolo` | Full authority; nothing is surfaced or awaited |
-| `bypassPermissions` | `--permission-mode bypass_permissions` | Same effective authority as `yolo`, different spelling |
-| `acceptEdits` | `--permission-mode accept_edits` | Accept file edits; deny the rest |
-| `auto` | `--permission-mode auto` | Qoder's native classifier decides |
-| `dontAsk` | `--permission-mode dont_ask` | Deny anything not already authorized |
+| `bypassPermissions` | `--permission-mode bypass_permissions` | Same authority as `yolo` for the operations measured below |
+| `acceptEdits` | `--permission-mode accept_edits` | File writes auto-accepted; shell commands denied |
+| `auto` | `--permission-mode auto` | Qoder's native classifier decides (not measured) |
+| `dontAsk` | `--permission-mode dont_ask` | Denies both file writes and shell commands |
+
+Measured authority, one `qoderclicn --print` run each, judged by what reached disk:
+
+| Mode | Wrote a file | Ran a shell command |
+|---|---|---|
+| `--yolo` | yes | yes (`BASH_PROBE.txt` contained `ran`) |
+| `--permission-mode bypass_permissions` | yes | not measured |
+| `--dangerously-skip-permissions` | yes | not measured |
+| `--permission-mode accept_edits` | yes | **no** — replied `denied`, no file created |
+| `--permission-mode dont_ask` | **no** — replied "Could not complete — writes are blocked" | no |
+
+Nothing hung: a denied operation is reported in the final text, so a restrictive mode degrades the answer rather than stalling the run.
+
+`--yolo` is not listed in `qoderclicn --help`; it is an undocumented alias that the SDK also treats as equivalent (`yolo` and `bypassPermissions` both normalize to `bypass_permissions`), while `--dangerously-skip-permissions` is a separate documented switch. All three granted the writes tested here; equivalence beyond those operations is not claimed.
 
 `plan` is deliberately **not** offered: the CLI's `--permission-mode` enum has no `plan` member, and this provider has no control channel to enter it.
+
+**`acceptEdits` is the measured sweet spot for code-editing delegations** — it keeps the file-write authority such a task needs and drops the shell authority it usually does not, at no cost to completion (denials are reported, not hung).
 
 > **Understand the default before changing it.** There is no approval channel here at all — a child runs unattended. So `yolo` means an autonomous Qoder agent holds write and shell authority over the delegating Session's real workspace, acting on text a model composed. dsh's sandbox backends (bwrap, Landlock, Seatbelt) are Linux/macOS, so on Windows nothing confines it. Anything the child reads is an instruction-injection path into that authority. Set `permissionMode: acceptEdits`, `auto`, or `dontAsk` to tighten it, or mount a second provider row with its own `toolName` so a low-privilege tool is the one reached by default.
 

@@ -1,22 +1,12 @@
 /**
- * One-shot Qoder lifecycle: invoke the Qoder Agent SDK, place its real
- * qodercli process under the shared subprocess owner, map only strict SDK
- * success to completion, and dispose to whole-range quiescence.
+ * One-shot Qoder lifecycle: spawn the real qodercli under the shared subprocess
+ * owner, submit the task over stdin, accept only a strict terminal result, and
+ * dispose to whole-range quiescence.
  *
  * @module dsh-subagent-qoder/run
  */
 
 import { randomUUID } from 'node:crypto'
-import {
-  ProcessTransport,
-  query as officialQuery,
-  type AuthOptions,
-  type Options,
-  type Query,
-  type SDKMessage,
-  type SDKResultMessage,
-  type SpawnOptions,
-} from '@qoder-ai/qoder-agent-sdk'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import { brandString } from '@deepseek-ai/dsh-brand'
 import type { SessionId } from '@deepseek-ai/dsh-session'
@@ -28,57 +18,34 @@ import {
   type SubagentStartRequest,
   type SubagentStopReason,
 } from '@deepseek-ai/dsh-subagent'
-import {
-  scrubbedParentEnv,
-  type SubprocessHandle,
-  type SubprocessOutcome,
-  type SubprocessSpawnSpec,
+import type {
+  SubprocessHandle,
+  SubprocessOutcome,
 } from '@deepseek-ai/dsh-subprocess'
 import {
-  ManagedQoderProcess,
+  createLineBuffer,
+  parseResultLine,
   qoderSpawnSpec,
-} from './process.ts'
+  type QoderPermissionMode,
+  type QoderWireSpec,
+} from './wire.ts'
 
 /** Default POSIX grace between subprocess termination tiers. */
 export const DEFAULT_DISPOSE_GRACE_MS = 3_000
 
-/** Qoder permission modes that cannot wait for a human response. */
-export const QODER_PERMISSION_MODES = [
-  'dontAsk',
-  'acceptEdits',
-  'auto',
-  'plan',
-  'yolo',
-  'bypassPermissions',
-] as const satisfies readonly NonNullable<Options['permissionMode']>[]
+export type { QoderPermissionMode, QoderWireSpec } from './wire.ts'
+export { QODER_PERMISSION_MODES, QODER_FULL_ACCESS_MODES, DEFAULT_QODER_PERMISSION_MODE } from './wire.ts'
 
-/** Profile-selectable non-interactive Qoder permission mode. */
-export type QoderPermissionMode = typeof QODER_PERMISSION_MODES[number]
+/** Host-side inputs: the wire spec plus the process service and diagnostics. */
+export interface QoderRunSpec extends QoderWireSpec {
+  /** Shared subprocess service spawn operation. */
+  readonly spawn: (spec: ReturnType<typeof qoderSpawnSpec>) => SubprocessHandle
+  /** Host diagnostic sink for a product failure kept outside model-visible text. */
+  readonly onError?: (error: Error, stopReason: SubagentStopReason) => void
+}
 
-/**
- * Modes that grant the child full authority, so no permission may be surfaced
- * to a human. `yolo` and `bypassPermissions` are the same effective mode on the
- * Qoder side: the SDK maps `yolo` to the CLI's `--yolo` flag and deliberately
- * suppresses `--dangerously-skip-permissions` for it, while both normalize to
- * `bypass_permissions` on the control path.
- */
-export const QODER_FULL_ACCESS_MODES = ['yolo', 'bypassPermissions'] as const satisfies readonly QoderPermissionMode[]
-
-/** Safe default for unattended Qoder runs. */
-export const DEFAULT_QODER_PERMISSION_MODE: QoderPermissionMode = 'yolo'
-
-type QoderFailureStage =
-  | 'query-start'
-  | 'query-run'
-  | 'process'
-  | 'teardown'
-
-type QoderFailureCategory =
-  | 'limit'
-  | 'product-error'
-  | 'invalid-result'
-  | 'process'
-  | 'unknown'
+type QoderFailureStage = 'spawn' | 'run' | 'process' | 'teardown'
+type QoderFailureCategory = 'limit' | 'product-error' | 'invalid-result' | 'process' | 'unknown'
 
 interface QoderFailureFacts {
   readonly stage: QoderFailureStage
@@ -87,36 +54,23 @@ interface QoderFailureFacts {
 }
 
 function failureDiagnostic(facts: QoderFailureFacts): string {
-  const fields = [
-    'product: Qoder',
-    `stage: ${facts.stage}`,
-    `category: ${facts.category}`,
-  ]
-  const exitCode = facts.outcome?.exitCode
-  if (exitCode !== null && exitCode !== undefined) {
-    fields.push(`exit code: ${exitCode}`)
-  }
-  const signal = facts.outcome?.signal
-  if (signal !== null && signal !== undefined) {
-    fields.push(`signal: ${signal}`)
-  }
+  const fields = ['product: Qoder', `stage: ${facts.stage}`, `category: ${facts.category}`]
+  const { exitCode, signal } = facts.outcome ?? {}
+  if (exitCode !== null && exitCode !== undefined) fields.push(`exit code: ${exitCode}`)
+  if (signal !== null && signal !== undefined) fields.push(`signal: ${signal}`)
   return `Product subagent failure (${fields.join('; ')})`
 }
 
 class QoderFailure extends Error {
-  constructor(
-    readonly facts: QoderFailureFacts,
-    cause?: unknown,
-  ) {
-    super(
-      `subagent-qoder: ${failureDiagnostic(facts)}`,
-      cause === undefined ? undefined : { cause },
-    )
+  constructor(readonly facts: QoderFailureFacts, detail?: string, cause?: unknown) {
+    const base = `subagent-qoder: ${failureDiagnostic(facts)}`
+    super(detail === undefined || detail.length === 0 ? base : `${base}; ${detail}`,
+      cause === undefined ? undefined : { cause })
     this.name = 'QoderFailure'
   }
 }
 
-function sdkFailureCategory(subtype: string): QoderFailureCategory {
+function categoryForSubtype(subtype: string): QoderFailureCategory {
   switch (subtype) {
     case 'error_max_turns':
     case 'error_max_budget_usd':
@@ -129,63 +83,22 @@ function sdkFailureCategory(subtype: string): QoderFailureCategory {
 }
 
 /**
- * Hide an unpublished product startup failure behind fixed safe facts.
+ * Hide a startup failure behind fixed safe facts.
  * @param cause - original host-side failure retained only on the Error cause chain.
  * @returns a rejection safe to expose through the subagent start boundary.
  */
 export function qoderStartupFailure(cause: unknown): Error {
-  return new QoderFailure({ stage: 'query-start', category: 'unknown' }, cause)
-}
-
-function unattendedDiagnostic(
-  mode: QoderPermissionMode,
-  request: 'tool permission' | 'MCP elicitation',
-  decision: 'denied' | 'declined',
-  reason: string,
-): string {
-  return `Qoder unattended decision (mode: ${mode}; request: ${request}; decision: ${decision}): ${reason}`
-}
-
-/** Fully resolved inputs for one Qoder Agent SDK query. */
-export interface QoderRunSpec {
-  /** Parent Session workspace supplied to the SDK and real CLI. */
-  readonly cwd: string
-  /** Authentication for the direct qodercli child session. */
-  readonly auth: AuthOptions
-  /** Profile-selected model; omitted to preserve Qoder settings. */
-  readonly model?: string
-  /** Profile-selected native non-interactive permission mode. */
-  readonly permissionMode: QoderPermissionMode
-  /**
-   * Proxy for the child's own outbound traffic. The SDK does not discover one
-   * from the inherited environment, so it must be passed explicitly.
-   */
-  readonly proxy?: string
-  /** Optional explicit path to the qodercli executable. */
-  readonly pathToQoderCLIExecutable?: string
-  /** Explicit deployment/test environment layered after shared scrubbing. */
-  readonly env: Record<string, string>
-  /** Subprocess termination grace passed to the shared managed-range owner. */
-  readonly disposeGraceMs: number
-  /** Shared subprocess service spawn operation. */
-  readonly spawn: (spec: SubprocessSpawnSpec) => SubprocessHandle
-  /** Host diagnostic sink for a product failure kept outside model-visible text. */
-  readonly onError?: (error: Error, stopReason: SubagentStopReason) => void
+  return new QoderFailure({ stage: 'spawn', category: 'unknown' }, undefined, cause)
 }
 
 function thrown(value: unknown): Error {
   return value instanceof Error ? value : new Error(String(value))
 }
 
-/** Read live request cancellation across awaited startup cleanup. */
-function isAborted(signal: AbortSignal): boolean {
-  return signal.aborted
-}
-
 /**
- * Validate and preserve the one-shot task before crossing the SDK boundary.
+ * Validate and preserve the one-shot task before crossing the process boundary.
  * @param prompt - task content accepted from the shared subagent service.
- * @returns the exact text sequence as one SDK prompt.
+ * @returns the exact text sequence as one prompt string.
  */
 export function textTask(prompt: readonly ContentBlock[]): string {
   if (prompt.length === 0) {
@@ -205,173 +118,93 @@ export function textTask(prompt: readonly ContentBlock[]): string {
 }
 
 /**
- * Strictly derive the only SDK result that can complete a shared run.
- * @param message - the SDK discriminated result union.
- * @returns exact final text for a successful, non-error result.
+ * Consume protocol lines until a strict terminal result, ignoring the child's
+ * reasoning, tool traffic, and hook chatter, which never reach the parent.
+ * @param lines - async stream of stdout lines.
+ * @returns the completed shared result.
  */
-export function successfulResult(message: SDKResultMessage): string {
-  if (message.subtype !== 'success') {
-    const category = sdkFailureCategory(message.subtype)
-    const detail = category === 'unknown'
-      ? undefined
-      : message.errors.join('; ')
-    throw new QoderFailure(
-      { stage: 'query-run', category },
-      detail === undefined || detail.length === 0
-        ? undefined
-        : new Error(detail),
-    )
-  }
-  if (message.is_error || message.result.trim().length === 0) {
-    throw new QoderFailure({ stage: 'query-run', category: 'invalid-result' })
-  }
-  return message.result
-}
-
-/**
- * Consume the complete SDK stream and require one strict success plus normal
- * iterator completion.
- */
-export async function consumeQoderQuery(
-  query: AsyncIterable<SDKMessage>,
-  onPermissionDenied?: () => void,
-  onResult?: () => void,
+export async function consumeQoderStream(
+  lines: AsyncIterable<string>,
 ): Promise<SubagentResult> {
-  let answer: string | undefined
-  for await (const message of query) {
-    if (message.type === 'system' && message.subtype === 'permission_denied') {
-      onPermissionDenied?.()
-      continue
+  for await (const line of lines) {
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(line)
+    } catch {
+      continue // Non-protocol noise on stdout is not a failure.
     }
+    if (parsed === null || typeof parsed !== 'object') continue
+    const message = parsed as Record<string, unknown>
     if (message.type !== 'result') continue
-    onResult?.()
-    answer = successfulResult(message)
+    const outcome = parseResultLine(message as Parameters<typeof parseResultLine>[0])
+    if (outcome.detail !== undefined) {
+      throw new QoderFailure(
+        { stage: 'run', category: typeof message.subtype === 'string'
+          ? categoryForSubtype(message.subtype) : 'invalid-result' },
+        outcome.detail,
+      )
+    }
+    return {
+      output: [{ type: 'text', text: outcome.text }],
+      stopReason: 'completed',
+    }
   }
-  if (answer === undefined) {
-    throw new QoderFailure({ stage: 'query-run', category: 'invalid-result' })
-  }
+  throw new QoderFailure({ stage: 'run', category: 'invalid-result' }, 'stream ended with no result message')
+}
+
+/**
+ * Turn one stdout byte stream into a line stream the consumer can iterate.
+ * @param source - the child's stdout, or `undefined` when unavailable.
+ * @returns an async line iterable.
+ */
+function toLineStream(source: NodeJS.ReadableStream | undefined): AsyncIterable<string> {
+  const { feed, flush } = createLineBuffer()
   return {
-    output: [{ type: 'text', text: answer }],
-    stopReason: 'completed',
+    async *[Symbol.asyncIterator]() {
+      if (source === undefined) return
+      const iterable = source as AsyncIterable<Buffer | string>
+      for await (const chunk of iterable) {
+        for (const line of feed(chunk.toString('utf8'))) yield line
+      }
+      for (const line of flush()) yield line
+    },
   }
 }
 
 /**
- * Close the query, terminate the managed range, and wait for the subprocess
- * owner to prove it is quiescent.
+ * Terminate the managed range and wait for the owner to prove quiescence.
+ * @param child - shared handle owning the qodercli managed range.
  */
-export async function disposeQoderChild(
-  query: Pick<Query, 'close'> | undefined,
-  child: SubprocessHandle,
-): Promise<void> {
+export async function disposeQoderChild(child: SubprocessHandle): Promise<void> {
   const failures: Error[] = []
   let outcome: SubprocessOutcome | undefined
-  void child.done.then(
-    (value) => { outcome = value },
-    () => {},
-  )
+  void child.done.then((value) => { outcome = value }, () => {})
   try {
-    await query?.close()
+    child.stdin?.end()
   } catch (error: unknown) {
     failures.push(thrown(error))
   }
-
   child.terminate()
   try {
     await child.waitForExit()
   } catch (error: unknown) {
     failures.push(thrown(error))
   }
-
   const firstFailure = failures[0]
   if (firstFailure !== undefined) {
-    const facts = { stage: 'teardown', category: 'unknown', outcome } as const
     const cause = failures.length === 1
       ? firstFailure
       : new AggregateError(failures, 'Qoder teardown failures')
-    throw new QoderFailure(facts, cause)
+    throw new QoderFailure({ stage: 'teardown', category: 'unknown', outcome }, undefined, cause)
   }
   await child.done.catch(() => {})
 }
 
 /**
- * Build the fixed SDK options for one one-shot provider run.
- * @param spec - Workspace, auth, environment, process service, and disposal policy.
- * @param controller - per-run cancellation owner.
- * @param capture - receives the shared child and SDK-facing process synchronously.
- * @param captureDiagnostic - receives safe facts from unattended interaction callbacks.
- * @returns options that inherit native settings while disabling persistence and user questions.
- */
-export function qoderQueryOptions(
-  spec: QoderRunSpec,
-  controller: AbortController,
-  capture: (
-    child: SubprocessHandle,
-    process: ManagedQoderProcess,
-  ) => void,
-  captureDiagnostic: (diagnostic: string) => void,
-): Options {
-  return {
-    auth: spec.auth,
-    // Force the child-process transport so the SDK calls `spawnQoderCLIProcess`
-    // and dsh's subprocess seam owns the qodercli managed range. The SDK's baked
-    // default is the `worker` transport, which runs the runtime in a worker
-    // thread and never fires the spawn hook — leaving dsh unable to terminate it.
-    transport: ProcessTransport.default,
-    abortController: controller,
-    cwd: spec.cwd,
-    ...spec.model === undefined ? {} : { model: spec.model },
-    ...spec.pathToQoderCLIExecutable === undefined
-      ? {}
-      : { pathToQoderCLIExecutable: spec.pathToQoderCLIExecutable },
-    ...spec.proxy === undefined ? {} : { proxy: spec.proxy },
-    env: { ...scrubbedParentEnv(), ...spec.env },
-    persistSession: false,
-    disallowedTools: spec.permissionMode === 'plan'
-      ? ['AskUserQuestion', 'ExitPlanMode']
-      : ['AskUserQuestion'],
-    permissionMode: spec.permissionMode,
-    // Full-access modes must not receive the deny callback: routing a surfaced
-    // permission to it would silently defeat `yolo`.
-    ...(QODER_FULL_ACCESS_MODES as readonly string[]).includes(spec.permissionMode)
-      ? { allowDangerouslySkipPermissions: true }
-      : {
-        canUseTool: () => {
-          captureDiagnostic(unattendedDiagnostic(
-            spec.permissionMode,
-            'tool permission',
-            'denied',
-            'the provider does not request human approval',
-          ))
-          return Promise.resolve({
-            behavior: 'deny' as const,
-            message: 'This unattended Qoder subagent cannot request human approval.',
-          })
-        },
-      },
-    onElicitation: () => {
-      captureDiagnostic(unattendedDiagnostic(
-        spec.permissionMode,
-        'MCP elicitation',
-        'declined',
-        'the provider does not collect interactive MCP input',
-      ))
-      return Promise.resolve({ action: 'decline' } as const)
-    },
-    spawnQoderCLIProcess: (options: SpawnOptions) => {
-      const child = spec.spawn(qoderSpawnSpec(options, spec.disposeGraceMs))
-      const process = new ManagedQoderProcess(child)
-      capture(child, process)
-      return process
-    },
-  }
-}
-
-/**
- * Start one Qoder Agent SDK query and publish its one-shot run.
+ * Start one qodercli one-shot run and publish its run handle.
  * @param request - resolved shared subagent request.
- * @param spec - Workspace, auth, environment, process service, and diagnostic policy.
- * @returns the published run after both Query and the real CLI handle exist.
+ * @param spec - wire inputs plus the process service and diagnostic policy.
+ * @returns the published run after the child exists.
  */
 export async function startQoderRun(
   request: SubagentStartRequest,
@@ -379,7 +212,7 @@ export async function startQoderRun(
 ): Promise<SubagentRun> {
   const prompt = textTask(request.prompt)
   if (request.signal.aborted) {
-    throw new Error('subagent-qoder: request was aborted before SDK startup')
+    throw new Error('subagent-qoder: request was aborted before spawn')
   }
 
   const controller = new AbortController()
@@ -398,155 +231,64 @@ export async function startQoderRun(
     }
   }
 
-  let child: SubprocessHandle | undefined
-  let childFailure: Error | undefined
-  let childProcessFailure: Promise<never> | undefined
-  let query: Query | undefined
-  let managedProcess: ManagedQoderProcess | undefined
-  let diagnostic: string | undefined
-  const capturePermissionDiagnostic = (value: string): void => {
-    diagnostic = value
-  }
-  const prependFailureDiagnostic = (facts: QoderFailureFacts): void => {
-    const failure = failureDiagnostic(facts)
-    diagnostic = diagnostic === undefined
-      ? failure
-      : `${failure}\n${diagnostic}`
-  }
-  const captureChild = (
-    captured: SubprocessHandle,
-    process: ManagedQoderProcess,
-  ): void => {
-    child = captured
-    managedProcess = process
-    childProcessFailure = captured.done.then(
-      () => new Promise<never>(() => {}),
-      (error: unknown) => {
-        childFailure = thrown(error)
-        throw childFailure
-      },
-    )
-    void childProcessFailure.catch(() => {})
-  }
+  let child: SubprocessHandle
   try {
-    query = officialQuery({
-      prompt,
-      options: qoderQueryOptions(
-        spec,
-        controller,
-        captureChild,
-        capturePermissionDiagnostic,
-      ),
-    })
-    // The Qoder SDK starts its transport lazily: nothing spawns, and so nothing
-    // calls `spawnQoderCLIProcess`, until the session is driven. Force the
-    // initialize handshake so the managed child handle exists before publication.
-    await query.initializationResult()
-    if (child === undefined || childProcessFailure === undefined) {
-      throw new Error(
-        'subagent-qoder: SDK did not publish a controllable qodercli process',
-      )
-    }
-    if (isAborted(controller.signal)) {
-      throw new Error('subagent-qoder: request was aborted before SDK startup')
-    }
+    child = spec.spawn(qoderSpawnSpec(spec))
   } catch (error: unknown) {
     request.signal.removeEventListener('abort', onAbort)
-    const cancelledBeforeCleanup = controller.signal.aborted
-    await Promise.resolve()
-    const startupOutcome = managedProcess?.outcome
-    const startupFacts = {
-      stage: 'query-start',
-      category: 'unknown',
-      outcome: startupOutcome,
-    } as const
-    const startupFailure = (cause: unknown = childFailure ?? error): QoderFailure => new QoderFailure(
-      startupFacts,
-      thrown(cause),
-    )
     requestCancel()
-    if (child !== undefined) {
-      try {
-        await disposeQoderChild(query, child)
-      } catch (disposeError: unknown) {
-        const failure = startupFailure()
-        const cleanupFailure = thrown(disposeError)
-        const aggregate = new AggregateError(
-          [failure, cleanupFailure],
-          `${failure.message}; ${cleanupFailure.message}`,
-        )
-        reportFailure(aggregate)
-        throw aggregate
-      }
-      if (cancelledBeforeCleanup || isAborted(request.signal)) {
-        throw new Error('subagent-qoder: request was aborted before SDK startup')
-      }
-      const failure = startupFailure()
-      reportFailure(failure)
-      throw failure
-    } else if (query !== undefined) {
-      try {
-        await query.close()
-      } catch (disposeError: unknown) {
-        const failure = startupFailure()
-        const cleanupFailure = new QoderFailure({
-          stage: 'teardown',
-          category: 'unknown',
-        }, thrown(disposeError))
-        const aggregate = new AggregateError(
-          [failure, cleanupFailure],
-          `${failure.message}; ${cleanupFailure.message}`,
-        )
-        reportFailure(aggregate)
-        throw aggregate
-      }
-    }
-    if (cancelledBeforeCleanup || isAborted(request.signal)) {
-      throw new Error('subagent-qoder: request was aborted before SDK startup')
-    }
-    const failure = startupFailure()
+    const failure = new QoderFailure(
+      { stage: 'spawn', category: 'unknown' }, undefined, thrown(error),
+    )
     reportFailure(failure)
     throw failure
   }
 
-  const publishedQuery = query
-  const publishedChild = child
-  const publishedProcessFailure = childProcessFailure
+  // Deliver the task, then close stdin so the child starts and terminates.
+  try {
+    child.stdin?.write(prompt)
+    child.stdin?.end()
+  } catch (error: unknown) {
+    const failure = new QoderFailure(
+      { stage: 'spawn', category: 'unknown' }, undefined, thrown(error),
+    )
+    void disposeQoderChild(child).catch(() => {})
+    request.signal.removeEventListener('abort', onAbort)
+    requestCancel()
+    reportFailure(failure)
+    throw failure
+  }
+
+  const publishedFailure = child.done.then(
+    (outcome) => new Promise<never>((_resolve, reject) => {
+      reject(new QoderFailure(
+        { stage: 'process', category: 'process', outcome },
+        'qodercli exited before publishing a result',
+      ))
+    }),
+  )
+  void publishedFailure.catch(() => {})
+
   let receivedResult = false
   const result = settleRunResult({
     attempt: async () => {
       try {
-        return await Promise.race([
-          consumeQoderQuery(publishedQuery, () => {
-            capturePermissionDiagnostic(unattendedDiagnostic(
-              spec.permissionMode,
-              'tool permission',
-              'denied',
-              'Qoder denied the request before an interactive prompt',
-            ))
-          }, () => {
+        const value = await Promise.race([
+          (async () => {
+            const settled = await consumeQoderStream(toLineStream(child.stdout))
             receivedResult = true
-          }),
-          publishedProcessFailure,
+            return settled
+          })(),
+          publishedFailure,
         ])
+        return value
       } catch (error: unknown) {
-        const processOutcome = managedProcess?.outcome
-        let facts: QoderFailureFacts
-        if (error instanceof QoderFailure) {
-          facts = { ...error.facts, outcome: processOutcome }
-        } else if (processOutcome !== undefined && !receivedResult) {
-          facts = { stage: 'process', category: 'process', outcome: processOutcome }
-        } else {
-          facts = { stage: 'query-run', category: 'unknown', outcome: processOutcome }
-        }
-        prependFailureDiagnostic(facts)
-        throw error instanceof QoderFailure
-          ? error
-          : new QoderFailure(facts, thrown(error))
+        if (receivedResult || error instanceof QoderFailure) throw error
+        throw new QoderFailure({ stage: 'run', category: 'unknown' }, undefined, thrown(error))
       }
     },
     collectOutput: () => [],
-    collectDiagnostic: () => diagnostic,
+    collectDiagnostic: () => undefined,
     cancelled: () => controller.signal.aborted,
     onError: spec.onError,
     signal: request.signal,
@@ -561,7 +303,7 @@ export async function startQoderRun(
     requestCancel,
     teardown: async () => {
       try {
-        await disposeQoderChild(publishedQuery, publishedChild)
+        await disposeQoderChild(child)
       } catch (error: unknown) {
         const failure = thrown(error)
         reportFailure(failure)

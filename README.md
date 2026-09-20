@@ -18,6 +18,8 @@ dsh plugin --profile <name> add ../dsh-subagent-qoder
 dsh --profile <name>
 ```
 
+If pnpm reports `ERR_PNPM_IGNORED_BUILDS` for `@qoder-ai/qoder-agent-sdk`, set its `allowBuilds` key to `true` in the Profile's `pnpm-workspace.yaml` (pnpm writes the placeholder for you) and re-run — see [Verified install gotchas](#verified-install-gotchas).
+
 Installing controls Host availability, not model permission.
 
 ## Configure the provider
@@ -117,7 +119,7 @@ Inherited from the one-shot SDK design, same as the Claude Code provider:
 - No human approval path — `AskUserQuestion` is disabled and permission prompts are denied (except under `bypassPermissions`); MCP elicitation is declined.
 - Authentication and account state remain native — the Bundle supplies the SDK/CLI but does not log in or rewrite Qoder settings.
 - No wall-clock timeout or side-effect rollback — cancel long work via the caller; files changed before cancellation are not restored.
-- The Qoder SDK is a fast-moving dependency (pinned `^1.0.45` here); verify `query()`/`Options`/result-shape compatibility after upgrading, as `@deepseek-ai/*` peer versions must stay consistent with the dsh installation.
+- The Qoder SDK is a fast-moving dependency (pinned `^1.0.45` here); verify `query()`/`Options`/result-shape compatibility after upgrading. The dsh side requires `@deepseek-ai/dsh-subagent >= 0.1.6-alpha.2` for the out-of-process helpers.
 
 ## Source map
 
@@ -128,20 +130,34 @@ Inherited from the one-shot SDK design, same as the Claude Code provider:
 | `src/process.ts` | `qodercli` spawn hook under the shared subprocess managed-range owner |
 | `cordis.patch.yml` | Profile layer that registers the dormant provider |
 
-## Contract verification (static)
+## Verification record
 
-Every `@deepseek-ai/*` symbol this provider calls was read from the harness source, not assumed. Cross-checked against `deepseek-harness@master`:
+All of the following was run on a real machine (Windows, `dsh 0.1.6-alpha.2`, Qoder SDK 1.0.45 driving `qoderclicn 1.1.58`).
 
-| Symbol | Source | This provider's usage |
+| Step | Command / method | Result |
 |---|---|---|
-| `SubagentProvider` (name/capabilities/inheritsParentContext/start) | `packages/subagent/subagent/src/types.ts` | implemented by `QoderProvider` |
-| `SubagentStartRequest.prompt: ContentBlock[]`, `parent`, `signal` | `types.ts` | `textTask(request.prompt)`, `request.parent.session.header.cwd` |
-| `SubagentResult { output: ContentBlock[]; stopReason }` | `types.ts` | `consumeQoderQuery` returns `{output:[{type:'text'}],stopReason:'completed'}` |
-| `SubagentRun` / `SubprocessRunHandleParts` | `src/types.ts`, `src/out-of-process.ts` | `subprocessRunHandle({id,result,signal,onAbort,requestCancel,teardown})` |
-| `settleRunResult(RunResultSettlement)` | `src/out-of-process.ts:192` | attempt/collectOutput/collectDiagnostic/cancelled/onError/signal/onAbort |
-| `resolveChildCwd(prefix, configured, parentCwd)` | `src/out-of-process.ts:147` | `resolveChildCwd('subagent-qoder', undefined, parentCwd)` |
-| `assertPositiveFinite`, `NO_START_CAPABILITIES` | `src/out-of-process.ts:72,57` | config validation + capabilities |
-| `SubprocessSpawnSpec` / `SubprocessHandle` / `SubprocessOutcome` | `packages/subprocess/subprocess/src/types.ts` | `qoderSpawnSpec` builds it; `ManagedQoderProcess` projects it |
-| `scrubbedParentEnv(): Record<string,string>` | `packages/subprocess/subprocess/src/index.ts:66` | env base under the `env` overlay |
+| SDK link only | `smoke/smoke.mjs` with `QODER_CLI_PATH` | `result: "QODER_OK"`, spawn hook fired once |
+| Real type build | `tsc -p tsconfig.json` against installed `@deepseek-ai/*@0.1.6-alpha.2` peer types | exit 0; emits `lib/*.js` + `lib/types/*.d.ts`; `./run.ts` specifiers rewritten to `./run.js` |
+| Bundle install | `dsh plugin --profile <p> add file:<checkout>` | installed; Qoder SDK postinstall fetched the win32-x64 worker runtime with checksum |
+| Patch composition | `dsh --profile <p> --dump-config` | provider row appears with provenance `# == dsh-subagent-qoder` |
+| Plugin contract | `import('dsh-subagent-qoder')` in the profile | `name=subagent-qoder`, `inject=["subagents","subprocess"]`, `apply`/`Config` present |
+| Delegation end-to-end | `provider.start()` with real `settleRunResult`/`subprocessRunHandle`/`resolveChildCwd` + a `SubprocessHandle` shim | `stopReason=completed`, `output=[{type:'text',text:'QODER_OK'}]`, `localAgent=undefined` |
 
-The Qoder-SDK side (`query`, `Options.spawnQoderCLIProcess`, `ProcessTransport`, `SDKResultMessage`, `PermissionMode`) is verified at runtime by [`smoke/`](smoke/) against SDK 1.0.45 / CLI 1.1.58. What remains unproven locally is only a full `tsc` of `src/` inside a dsh Profile (needs the `@deepseek-ai/*` peer types installed).
+### Verified install gotchas
+
+1. **Requires `dsh >= 0.1.6-alpha.2`.** The `0.1.5-rc.x` line has no `out-of-process` module, so `settleRunResult`, `subprocessRunHandle`, `resolveChildCwd`, `NO_START_CAPABILITIES` and `assertPositiveFinite` are not exported and this provider cannot build. Note that `@deepseek-ai/dsh-*` publish under `latest` an old `0.0.1-rc.1`; the usable train is the `alpha` dist-tag.
+2. **pnpm blocks the Qoder SDK build script.** `dsh plugin add` fails with `ERR_PNPM_IGNORED_BUILDS: @qoder-ai/qoder-agent-sdk`. pnpm writes the key for you — set it in the Profile's `pnpm-workspace.yaml` and re-run:
+   ```yaml
+   allowBuilds:
+     '@qoder-ai/qoder-agent-sdk': true
+   ```
+3. **`file:` installs may not auto-join the bundle stack.** After `add`, confirm the name reached `dsh.profile.bundles`; if absent, add it to the Profile manifest and restart.
+4. **`pathToQoderCLIExecutable` is effectively required.** The SDK's default package runtime is `Worker` and its postinstall skips the bundled CLI binary ("Set `QODER_INSTALL_BUNDLED_CLI=1` to install the process fallback as well"). Since this provider must use the process transport, point it at the CLI — and on a CN machine it must be the **CN** executable, because the worker runtime is the global brand and reports `No qodercli login found`.
+
+### Deviation from the Claude Code provider
+
+`query()` in the Qoder SDK starts its transport **lazily**: nothing calls `spawnQoderCLIProcess` until the session is driven. `run.ts` therefore awaits `Query.initializationResult()` before requiring the managed child handle. Without this, publication fails with `SDK did not publish a controllable qodercli process`. The provider also adds `auth` (Qoder requires it for direct `query()` sessions) and omits the SDK-absent `onUserDialog` / `supportedDialogKinds` options.
+
+### Still unverified
+
+The full parent-model path — a dsh Agent actually calling the `subagent_qoder` tool — has not been exercised: it needs a bootable Profile with `@deepseek-ai/dsh-tool-subagent` (+ Jobs rows) composed into the session's preset, plus provider credentials for the parent model. Everything below that seam is verified above.

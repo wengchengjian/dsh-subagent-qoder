@@ -30,19 +30,25 @@
     "clean": "rm -rf lib"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "*",
-    "@deepseek-ai/dsh-brand": "*",
-    "@deepseek-ai/dsh-llm": "*",
-    "@deepseek-ai/dsh-session": "*",
-    "@deepseek-ai/dsh-subagent": "*",
-    "@deepseek-ai/dsh-subprocess": "*",
-    "@deepseek-ai/dsh-timeout": "*",
-    "@deepseek-ai/schemastery": "*"
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-brand": ">=0.1.6-alpha.2",
+    "@deepseek-ai/dsh-llm": ">=0.1.6-alpha.2",
+    "@deepseek-ai/dsh-session": ">=0.1.6-alpha.2",
+    "@deepseek-ai/dsh-subagent": ">=0.1.6-alpha.2",
+    "@deepseek-ai/dsh-subprocess": ">=0.1.6-alpha.2",
+    "@deepseek-ai/dsh-timeout": ">=0.1.6-alpha.2",
+    "@deepseek-ai/schemastery": "^3.18.2"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-subagent": {
+      "note": "Must be >=0.1.6-alpha.2: the out-of-process helpers this provider composes (settleRunResult, subprocessRunHandle, resolveChildCwd, NO_START_CAPABILITIES, assertPositiveFinite) are absent from 0.1.5-rc.2."
+    }
   },
   "dependencies": {
     "@qoder-ai/qoder-agent-sdk": "^1.0.45"
   },
   "devDependencies": {
-    "typescript": "^5.6.0"
+    "@types/node": "^24.0.0",
+    "typescript": "^7.0.2"
   }
 }

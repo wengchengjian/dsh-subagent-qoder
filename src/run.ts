@@ -420,6 +420,10 @@ export async function startQoderRun(
         capturePermissionDiagnostic,
       ),
     })
+    // The Qoder SDK starts its transport lazily: nothing spawns, and so nothing
+    // calls `spawnQoderCLIProcess`, until the session is driven. Force the
+    // initialize handshake so the managed child handle exists before publication.
+    await query.initializationResult()
     if (child === undefined || childProcessFailure === undefined) {
       throw new Error(
         'subagent-qoder: SDK did not publish a controllable qodercli process',

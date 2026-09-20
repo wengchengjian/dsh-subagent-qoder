@@ -34,18 +34,23 @@ The provider row is registered by `cordis.patch.yml`. Add it directly to the Pro
 | `authEnvVar` | `QODER_PERSONAL_ACCESS_TOKEN` | Token variable when `authMode: env` |
 | `env` | `{}` | Child environment layered over the credential-scrubbed parent environment |
 | `pathToQoderCLIExecutable` | resolve from `PATH` | Optional absolute path to `qoderclicn` / `qodercli` |
-| `permissionMode` | `dontAsk` | Non-interactive policy fixed for every run from this instance |
+| `permissionMode` | `yolo` | Non-interactive policy fixed for every run from this instance |
 | `disposeGraceMs` | `3000` | Grace between managed-range termination tiers |
 
 `permissionMode` values and their unattended behavior:
 
 | Value | Behavior |
 |---|---|
+| `yolo` **(default)** | Full authority: every operation runs with no permission gate and no human in the loop |
 | `dontAsk` | Deny anything not already authorized instead of prompting |
 | `acceptEdits` | Accept file edits; remaining permission prompts are denied by the unattended callback |
 | `auto` | Let Qoder's native classifier allow or deny permission requests |
 | `plan` | Run in planning mode, deny execution approval, return the plan as the final answer |
-| `bypassPermissions` | Explicitly set `allowDangerouslySkipPermissions` and skip permission checks |
+| `bypassPermissions` | Same effective authority as `yolo`, different spelling |
+
+`yolo` and `bypassPermissions` are one mode on the Qoder side, not a ladder: the SDK maps `yolo` to the CLI's `--yolo` flag and deliberately suppresses `--dangerously-skip-permissions` for it (`allowDangerouslySkipPermissions && permissionMode !== "yolo"`), while both normalize to `bypass_permissions` on the control path. Both are treated as full-access here, which chiefly means **the deny-by-default `canUseTool` callback is not installed** — installing it would silently neutralize the mode.
+
+> **Understand the default before changing it.** This provider has no approval channel at all: `AskUserQuestion` is disallowed and no human can intervene mid-run. So the `yolo` default means an autonomous Qoder agent holds write and shell authority over the delegating Session's real workspace, driven by text a model composed. Nothing confines it here — dsh's sandbox backends (bwrap, Landlock, Seatbelt) are Linux/macOS, so on Windows there is no filesystem or process confinement around the child. Anything the child reads (a source file, a web page, a tool result) is an instruction-injection path straight into that authority. Set `permissionMode: acceptEdits`, `auto`, or `dontAsk` in the provider row to tighten it, or mount a second provider row with its own `toolName` so a low-privilege tool is the one the model reaches for by default.
 
 Credential-shaped ambient variables are removed before the `env` overlay, so a token intended for the child must be supplied via `authMode: env` or placed explicitly in `env`.
 
@@ -62,7 +67,8 @@ Append the rows you are missing to your Profile's `cordis.patch.yml` (`$DSH_HOME
   config:
     providerName: qoder
     authMode: env
-    permissionMode: dontAsk
+    # Opt in to a tighter policy than this provider's `yolo` default:
+    permissionMode: acceptEdits
     # pathToQoderCLIExecutable: 'C:/Users/you/.qoder-cn/bin/qoderclicn/qoderclicn.exe'
 
 # --- jobs registry + controls (needed only for run_in_background: true) ------
@@ -151,6 +157,8 @@ The last row closes what a Profile boot cannot show: the `tool_call` event prove
 | Background / Job path | `subagent_qoder` with `run_in_background: true`, then `job_output` | first `tool_result` = `started background subagent job subagent-1`; then `job_output {job_id:"subagent-1", wait:true}` → `QODER_BG_OK\n[status: completed]`; `final = QODER_BG_OK` |
 
 `job_kill` was not exercised. Note also that the parent's own `thinking` events appear in the parent stream while the child's reasoning never does — the isolation direction is as designed.
+
+| `yolo` default grants write | Provider row with `permissionMode` **omitted**, delegation asked to create `YOLO_PROOF.txt` containing `WRITE_OK` | `tool_result` reported the path; **on disk** the file existed, 8 bytes, content `WRITE_OK` (the parent then re-read it with its own `read` tool). A restrictive default would have denied the write |
 
 ### Verified install gotchas
 

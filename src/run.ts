@@ -48,14 +48,24 @@ export const QODER_PERMISSION_MODES = [
   'acceptEdits',
   'auto',
   'plan',
+  'yolo',
   'bypassPermissions',
 ] as const satisfies readonly NonNullable<Options['permissionMode']>[]
 
 /** Profile-selectable non-interactive Qoder permission mode. */
 export type QoderPermissionMode = typeof QODER_PERMISSION_MODES[number]
 
+/**
+ * Modes that grant the child full authority, so no permission may be surfaced
+ * to a human. `yolo` and `bypassPermissions` are the same effective mode on the
+ * Qoder side: the SDK maps `yolo` to the CLI's `--yolo` flag and deliberately
+ * suppresses `--dangerously-skip-permissions` for it, while both normalize to
+ * `bypass_permissions` on the control path.
+ */
+export const QODER_FULL_ACCESS_MODES = ['yolo', 'bypassPermissions'] as const satisfies readonly QoderPermissionMode[]
+
 /** Safe default for unattended Qoder runs. */
-export const DEFAULT_QODER_PERMISSION_MODE: QoderPermissionMode = 'dontAsk'
+export const DEFAULT_QODER_PERMISSION_MODE: QoderPermissionMode = 'yolo'
 
 type QoderFailureStage =
   | 'query-start'
@@ -315,7 +325,9 @@ export function qoderQueryOptions(
       ? ['AskUserQuestion', 'ExitPlanMode']
       : ['AskUserQuestion'],
     permissionMode: spec.permissionMode,
-    ...spec.permissionMode === 'bypassPermissions'
+    // Full-access modes must not receive the deny callback: routing a surfaced
+    // permission to it would silently defeat `yolo`.
+    ...(QODER_FULL_ACCESS_MODES as readonly string[]).includes(spec.permissionMode)
       ? { allowDangerouslySkipPermissions: true }
       : {
         canUseTool: () => {

@@ -66,9 +66,11 @@ export interface Config {
   pathToQoderCLIExecutable?: string
   /**
    * Native non-interactive mode fixed for this Provider instance. Defaults to
-   * `dontAsk`; `acceptEdits` accepts edits, `auto` uses the native classifier,
-   * `plan` returns a plan without approving execution, and
-   * `bypassPermissions` explicitly skips permission checks.
+   * `yolo` (full authority: no permission is ever surfaced or awaited, since
+   * this provider has no human approval channel). `acceptEdits` accepts edits
+   * and denies the rest, `auto` uses the native classifier, `plan` returns a
+   * plan without approving execution, and `bypassPermissions` is the same
+   * effective mode as `yolo` under a different spelling.
    */
   permissionMode?: QoderPermissionMode
   /** Grace in milliseconds between Qoder managed-range termination tiers. */

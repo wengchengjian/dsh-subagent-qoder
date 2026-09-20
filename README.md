@@ -83,6 +83,8 @@ Append the rows you are missing to your Profile's `cordis.patch.yml` (`$DSH_HOME
 
 **Agent preset:** the `@deepseek-ai/dsh-tool-subagent` row above exposes `subagent_qoder` to any agent composed from your Profile's rows. If a session is built from an Agent Preset instead, copy the preset and add a matching `@deepseek-ai/dsh-tool-subagent` tool entry (or flip its `disabled: true` to `false`); presets ship the row disabled so installing the Bundle alone never changes existing agents' tool surface.
 
+`maxDepth: provider-managed` is **required**, not cosmetic: this provider advertises no `depthLimit` capability, and omitting the field fails the whole Profile at boot with `tool-subagent: provider "qoder" cannot enforce maxDepth (no depthLimit capability)`. The check runs when the provider registers, so it is not visible to a unit-level `provider.start()` test — only to a real boot.
+
 A foreground call returns the final Qoder answer or an error with the stop reason and a safe diagnostic. A background call (`run_in_background: true`) returns a parent-owned Job id for `job_output` / `job_kill`.
 
 ## Authentication
@@ -151,7 +153,7 @@ All of the following was run on a real machine (Windows, `dsh 0.1.6-alpha.2`, Qo
    allowBuilds:
      '@qoder-ai/qoder-agent-sdk': true
    ```
-3. **`file:` installs may not auto-join the bundle stack.** After `add`, confirm the name reached `dsh.profile.bundles`; if absent, add it to the Profile manifest and restart.
+3. **Check the bundle stack after a failed install.** `dsh plugin add` reconciles `dsh.profile.bundles` on success, and a clean `file:` install does join it. But if the run fails partway (e.g. the build-script gate above), the dependency can land in `dependencies` without joining the bundle list — re-run the add after fixing, or add the name to `dsh.profile.bundles` yourself, then restart the Profile.
 4. **`pathToQoderCLIExecutable` is effectively required.** The SDK's default package runtime is `Worker` and its postinstall skips the bundled CLI binary ("Set `QODER_INSTALL_BUNDLED_CLI=1` to install the process fallback as well"). Since this provider must use the process transport, point it at the CLI — and on a CN machine it must be the **CN** executable, because the worker runtime is the global brand and reports `No qodercli login found`.
 
 ### Deviation from the Claude Code provider

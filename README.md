@@ -39,8 +39,18 @@ If pnpm reports `ERR_PNPM_IGNORED_BUILDS` for `@qoder-ai/qoder-agent-sdk`, set i
 | `authEnvVar` | `QODER_PERSONAL_ACCESS_TOKEN` | Token variable when `authMode: env` |
 | `env` | `{}` | Child environment layered over the credential-scrubbed parent environment |
 | `pathToQoderCLIExecutable` | auto-discovered | Absolute path override; see the discovery order above |
+| `proxy` | discovered | Proxy URL for the child's own outbound traffic; see [Proxy](#proxy) |
+| `useSystemProxy` | `true` | Fall back to `HTTP(S)_PROXY` then the OS system proxy when `proxy` is omitted |
 | `permissionMode` | `yolo` | Non-interactive policy fixed for every run from this instance |
 | `disposeGraceMs` | `3000` | Grace between managed-range termination tiers |
+
+## Proxy
+
+The Qoder SDK does **not** discover a proxy from the inherited environment — `Options.proxy` documents that an omitted value makes the child "connect directly and does not discover a proxy from the inherited environment". So passing `HTTP_PROXY` to the parent process does not reach the child; the provider passes it explicitly.
+
+Resolution order: `proxy` config → `HTTP(S)_PROXY`/`https_proxy`/`http_proxy` → operating-system setting → direct. On Windows the system setting is read from `HKCU\...\Internet Settings` (`ProxyEnable`/`ProxyServer`) and a bare `host:port` is normalized to `http://host:port`; a per-protocol list (`http=h:1;https=h:1`) is left alone rather than guessed, so set `proxy` explicitly in that case. macOS and Linux have no OS-level probe here — rely on the environment variables or `proxy`. Verified on this machine: with nothing configured and no env var, discovery yields `http://127.0.0.1:7897`; explicit config wins; `useSystemProxy: false` forces direct.
+
+A child that must not inherit a proxy uses `useSystemProxy: false` — the setting has no other "off" value, because an empty string is rejected by the schema.
 
 `permissionMode` values and their unattended behavior:
 
@@ -93,6 +103,8 @@ The inserted row requires `@deepseek-ai/dsh-tool-subagent`, plus `@deepseek-ai/d
 `maxDepth: provider-managed` is **required**, not cosmetic: this provider advertises no `depthLimit` capability, and omitting the field fails the whole Profile at boot with `tool-subagent: provider "qoder" cannot enforce maxDepth (no depthLimit capability)`. The check runs when the provider registers, so it is not visible to a unit-level `provider.start()` test — only to a real boot.
 
 A foreground call returns the final Qoder answer or an error with the stop reason and a safe diagnostic. A background call returns a parent-owned Job id for `job_output` / `job_kill`.
+
+**Background jobs do not notify a one-shot run.** Measured on the `headless` profile: with the session alive across multiple steps and a long generation, no completion notice arrived and no notice-driven turn was scheduled; and once the turn ended, `job_output <id>` returned `unknown job` with `job_list` empty, because the Jobs registry is per-process and exiting also tears the child down. So in a one-shot run either delegate in the foreground, or collect with `job_output` (`wait: true`) inside the same turn. Whether an interactive Web/desktop session receives the proactive notice was not tested here — do not assume it.
 
 ## Authentication
 
@@ -161,6 +173,8 @@ The last row closes what a Profile boot cannot show: the `tool_call` event prove
 
 | `yolo` default grants write | Provider row with `permissionMode` **omitted**, delegation asked to create `YOLO_PROOF.txt` containing `WRITE_OK` | `tool_result` reported the path; **on disk** the file existed, 8 bytes, content `WRITE_OK` (the parent then re-read it with its own `read` tool). A restrictive default would have denied the write |
 | **One-command, zero-config** | `node scripts/dsh-install.mjs <new-profile>` only; provider row carries **no** config, so the CLI path is auto-discovered and `authMode` defaults to `qodercli` | `--dump-config` composed both rows from the Bundle patch; a delegation created `ONECLICK.txt` and the bytes (`ZERO_CONFIG`) were confirmed on disk |
+| Proxy discovery | `resolveProxy()` across five input combinations, plus a live delegation with `Options.proxy` set | no config/no env → `http://127.0.0.1:7897` from the registry; explicit wins; `host:port` normalized with scheme; `useSystemProxy: false` → direct; env beats OS. Child inference succeeded through the explicit proxy |
+| No background notice | `run_in_background: true` with the session kept alive for a 300-word generation, then a resumed session | no notice and no notice-driven turn in either case; after the first process exited, `job_output subagent-1` → `unknown job`, `job_list` → `(no background jobs)` |
 
 ### Verified install gotchas
 

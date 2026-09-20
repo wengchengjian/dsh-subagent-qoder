@@ -156,6 +156,11 @@ export interface QoderRunSpec {
   readonly model?: string
   /** Profile-selected native non-interactive permission mode. */
   readonly permissionMode: QoderPermissionMode
+  /**
+   * Proxy for the child's own outbound traffic. The SDK does not discover one
+   * from the inherited environment, so it must be passed explicitly.
+   */
+  readonly proxy?: string
   /** Optional explicit path to the qodercli executable. */
   readonly pathToQoderCLIExecutable?: string
   /** Explicit deployment/test environment layered after shared scrubbing. */
@@ -319,6 +324,7 @@ export function qoderQueryOptions(
     ...spec.pathToQoderCLIExecutable === undefined
       ? {}
       : { pathToQoderCLIExecutable: spec.pathToQoderCLIExecutable },
+    ...spec.proxy === undefined ? {} : { proxy: spec.proxy },
     env: { ...scrubbedParentEnv(), ...spec.env },
     persistSession: false,
     disallowedTools: spec.permissionMode === 'plan'

@@ -66,8 +66,16 @@ export interface Config {
    * here (or resolved via `authMode: env`), never relied upon from the parent.
    */
   env?: Record<string, string>
-  /** Optional absolute path to the qodercli executable; omitted to resolve from PATH. */
+  /** Optional absolute path override; omitted to discover the CLI. */
   pathToQoderCLIExecutable?: string
+  /**
+   * Proxy URL for the child's own outbound traffic, given to the SDK explicitly
+   * because it does not discover one from the inherited environment. Omitted to
+   * fall back to `HTTP(S)_PROXY` and then the operating-system setting.
+   */
+  proxy?: string
+  /** Use an inherited `HTTP(S)_PROXY` or the OS system proxy when `proxy` is omitted. Defaults to true. */
+  useSystemProxy?: boolean
   /**
    * Native non-interactive mode fixed for this Provider instance. Defaults to
    * `yolo` (full authority: no permission is ever surfaced or awaited, since
@@ -88,13 +96,64 @@ export const Config: z<Config> = z.object({
   authEnvVar: z.string().min(1).default(DEFAULT_ACCESS_TOKEN_ENV_VAR),
   env: z.dict(z.string()).default({}),
   pathToQoderCLIExecutable: z.string().min(1),
+  proxy: z.string().min(1),
+  useSystemProxy: z.boolean().default(true),
   permissionMode: z.union([...QODER_PERMISSION_MODES])
     .default(DEFAULT_QODER_PERMISSION_MODE),
   disposeGraceMs: z.number().default(DEFAULT_DISPOSE_GRACE_MS),
 })
 
-type ResolvedConfig = Omit<Required<Config>, 'model' | 'pathToQoderCLIExecutable'>
-  & Pick<Config, 'model' | 'pathToQoderCLIExecutable'>
+type ResolvedConfig = Omit<
+  Required<Config>,
+  'model' | 'pathToQoderCLIExecutable' | 'proxy'
+> & Pick<Config, 'model' | 'pathToQoderCLIExecutable' | 'proxy'>
+
+/** `host:port` with no scheme, the shape the Windows registry stores. */
+const PROXY_HOST_PORT = /^[A-Za-z0-9._-]+:\d{1,5}$/
+
+function normalizeProxy(raw: string | undefined): string | undefined {
+  const value = raw?.trim()
+  if (value === undefined || value.length === 0) return undefined
+  if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(value)) return value
+  // A per-protocol list such as `http=h:1;https=h:1` is not representable as one
+  // URL, so leave it to an explicit `proxy` rather than guessing.
+  return PROXY_HOST_PORT.test(value) ? `http://${value}` : undefined
+}
+
+/**
+ * Read the Windows per-user system proxy, so a delegated child follows the same
+ * route the parent harness does. Other platforms are served by `proxy` or an
+ * inherited environment variable rather than untested platform calls.
+ */
+function windowsSystemProxy(): string | undefined {
+  const key = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings'
+  const readValue = (name: string): string | undefined => {
+    const result = spawnSync('reg', ['query', key, '/v', name], { encoding: 'utf8' })
+    if (result.status !== 0) return undefined
+    const pattern = new RegExp(`^\\s*${name}\\s+REG_[A-Z_]+\\s+(.+)$`, 'mi')
+    return result.stdout.match(pattern)?.[1]?.trim()
+  }
+  if (readValue('ProxyEnable') !== '0x1') return undefined
+  return normalizeProxy(readValue('ProxyServer'))
+}
+
+/**
+ * Resolve the child's outbound proxy: explicit config, then the inherited
+ * environment, then the operating-system setting.
+ * @param config - provider deployment settings.
+ * @returns a proxy URL, or `undefined` to connect directly.
+ */
+export function resolveProxy(config: Pick<Config, 'proxy' | 'useSystemProxy'>): string | undefined {
+  const explicit = normalizeProxy(config.proxy)
+  if (explicit !== undefined) return explicit
+  if (config.useSystemProxy === false) return undefined
+  const fromEnv = normalizeProxy(
+    process.env.HTTPS_PROXY ?? process.env.https_proxy
+    ?? process.env.HTTP_PROXY ?? process.env.http_proxy,
+  )
+  if (fromEnv !== undefined) return fromEnv
+  return process.platform === 'win32' ? windowsSystemProxy() : undefined
+}
 
 function buildAuth(config: ResolvedConfig): AuthOptions {
   return config.authMode === 'qodercli'
@@ -182,6 +241,7 @@ class QoderProvider implements SubagentProvider {
         ? {}
         : { pathToQoderCLIExecutable: this.config.pathToQoderCLIExecutable },
       permissionMode: this.config.permissionMode,
+      ...this.config.proxy === undefined ? {} : { proxy: this.config.proxy },
       env: this.config.env,
       disposeGraceMs: this.config.disposeGraceMs,
       spawn: spawnSpec => this.ctx.subprocess.spawn(spawnSpec),
@@ -203,6 +263,7 @@ class QoderProvider implements SubagentProvider {
  */
 export function apply(ctx: Context, config: Config): void {
   const cliPath = config.pathToQoderCLIExecutable ?? discoverQoderCLI()
+  const proxy = resolveProxy(config)
   const resolved: ResolvedConfig = {
     providerName: config.providerName ?? DEFAULT_PROVIDER_NAME,
     ...config.model === undefined ? {} : { model: config.model },
@@ -210,9 +271,15 @@ export function apply(ctx: Context, config: Config): void {
     authEnvVar: config.authEnvVar ?? DEFAULT_ACCESS_TOKEN_ENV_VAR,
     env: config.env as Record<string, string>,
     pathToQoderCLIExecutable: cliPath,
+    ...proxy === undefined ? {} : { proxy },
+    useSystemProxy: config.useSystemProxy ?? true,
     permissionMode: config.permissionMode ?? DEFAULT_QODER_PERMISSION_MODE,
     disposeGraceMs: config.disposeGraceMs as number,
   }
+  ctx.logger.debug(
+    'subagent-qoder: child proxy = %s',
+    proxy ?? 'direct (no proxy configured, inherited, or detected)',
+  )
   if (cliPath === undefined) {
     ctx.logger.warn(
       'subagent-qoder: no qodercli executable found via QODER_CLI_PATH, PATH, or the'

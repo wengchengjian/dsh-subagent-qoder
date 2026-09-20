@@ -1,199 +1,157 @@
 # dsh-subagent-qoder
 
-One-shot Qoder subagent provider for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (`dsh`), built over the official [`@qoder-ai/qoder-agent-sdk`](https://www.npmjs.com/package/@qoder-ai/qoder-agent-sdk). It is the Qoder sibling of `@deepseek-ai/dsh-subagent-claude-code`: a delegated task runs as a fresh, unattended `qodercli` session in the parent Session's workspace and returns only its final answer (or a safe failure diagnostic). Reasoning, tool traffic, stderr, and workspace diffs never enter the parent Session.
+A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (`dsh`) Profile Bundle that runs a delegated task as a fresh, unattended **Qoder CLI** session in the parent Session's workspace. It is the Qoder sibling of `@deepseek-ai/dsh-subagent-codex` and `@deepseek-ai/dsh-subagent-claude-code`.
 
-> This is an **out-of-tree Profile Bundle**, not a Qoder plugin. It plugs into dsh's subagent seam (`ctx.subagents`) and is exposed to the model through dsh's `@deepseek-ai/dsh-tool-subagent` tool row.
+Each delegation spawns the real `qoderclicn`/`qodercli` executable, submits one self-contained text task, and returns only its final answer (or a safe failure diagnostic). Reasoning, tool traffic, hook chatter, stderr, usage, and workspace diffs never enter the parent Session.
 
-## When to use
+> An out-of-tree Profile Bundle, not a Qoder plugin. It plugs into dsh's subagent seam (`ctx.subagents`) and is exposed to the model through dsh's `@deepseek-ai/dsh-tool-subagent` tool row.
 
-Mount it when a delegation should run as a genuine Qoder CLI session with isolated context, and one-shot semantics (no continuation, resume, or pooling) are acceptable. Native Qoder settings and authentication remain authoritative; the Profile chooses the model, environment, permission mode, and auth source.
+## Why it depends on nothing
+
+The Qoder Agent SDK is the obvious route, and it is the one thing that made installation painful: the SDK ships a `postinstall` that downloads a runtime this provider never uses, and pnpm 10+ blocks third-party build scripts — so `dsh plugin add` failed until the operator preset `allowBuilds` in the Profile's `pnpm-workspace.yaml`.
+
+Instead the provider speaks `qodercli`'s own protocol directly (`--print --output-format stream-json`), the same shape the official Codex provider uses for its app-server. That means one install command, no build scripts, and the child sitting straight under dsh's subprocess owner.
 
 ## Install
 
-One command, from a built checkout of this repository:
-
 ```sh
-npm install && npm run build
-node scripts/dsh-install.mjs <profile>     # or: npm run dsh:install -- <profile>
+dsh plugin --profile <profile> add github:wengchengjian/dsh-subagent-qoder
 ```
 
-The script initializes a missing Profile from the `headless` template (a bare `dsh plugin add` on an unknown name seeds only `dsh-base`, whose closure lacks the subagent seam and delegation tool this Bundle inserts a row for), allows the Qoder SDK's build script past pnpm's gate, installs the Bundle, and prints a verification command. It is idempotent; restart the Profile afterwards, since bundle membership is decided at start.
+Then restart that Profile — bundle membership is decided at start.
 
-To do it by hand instead:
+Installing from a local checkout works too (`add ../dsh-subagent-qoder`), and `lib/` is committed so neither route needs a build.
+
+**A brand-new Profile needs the template first.** `dsh plugin add` on an unknown name initializes it with `dsh-base` alone, whose closure has no subagent seam and no delegation tool, so the row this Bundle inserts cannot resolve:
 
 ```sh
-dsh plugin --profile <name> add ../dsh-subagent-qoder
+dsh --profile <name> --from-default-profile headless   # or web
+dsh plugin --profile <name> add github:wengchengjian/dsh-subagent-qoder
 ```
 
-If pnpm reports `ERR_PNPM_IGNORED_BUILDS` for `@qoder-ai/qoder-agent-sdk`, set its `allowBuilds` key to `true` in that Profile's `pnpm-workspace.yaml` (pnpm writes the placeholder) and re-run — see [Verified install gotchas](#verified-install-gotchas). Installing controls Host availability, not model permission.
+An existing `headless`/`web`-style Profile already carries the seam, `dsh-jobs-local`, and `dsh-tool-jobs`, so the single install command is enough.
 
-## Configure the provider
+## Configuration
 
-**Zero configuration is required.** The Bundle's own `cordis.patch.yml` registers the dormant provider *and* inserts the `subagent_qoder` tool row, and the provider discovers the `qodercli` executable by itself (`QODER_CLI_PATH` → `PATH` → `~/.qoder-cn/bin/qoderclicn` → `~/.qoder/bin/qodercli`). Set any of these in a provider row on the Profile's `cordis.patch.yml` only to override a default:
+Defaults are chosen so that **installing is the whole setup** — an empty provider row is valid. Override in the Profile's `cordis.patch.yml`:
 
 | Field | Default | Meaning |
 |---|---|---|
 | `providerName` | `qoder` | Registry name on `ctx.subagents`; each mounted instance needs a unique value |
-| `model` | native Qoder settings | Optional model fixed for every run from this instance |
-| `authMode` | `qodercli` | `qodercli` reuses the local `qodercli login`; `env` reads a personal access token from `authEnvVar` (use this for CI/headless hosts) |
-| `authEnvVar` | `QODER_PERSONAL_ACCESS_TOKEN` | Token variable when `authMode: env` |
-| `env` | `{}` | Child environment layered over the credential-scrubbed parent environment |
-| `pathToQoderCLIExecutable` | auto-discovered | Absolute path override; see the discovery order above |
-| `proxy` | discovered | Proxy URL for the child's own outbound traffic; see [Proxy](#proxy) |
-| `useSystemProxy` | `true` | Fall back to `HTTP(S)_PROXY` then the OS system proxy when `proxy` is omitted |
+| `model` | native Qoder settings | Optional model override passed as `--model` |
 | `permissionMode` | `yolo` | Non-interactive policy fixed for every run from this instance |
+| `pathToQoderCLIExecutable` | discovered | Absolute CLI path; see [Finding the CLI](#finding-the-cli) |
+| `proxy` | discovered | Exported to the child as `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` |
+| `useSystemProxy` | `true` | Fall back to inherited `HTTP(S)_PROXY`, then the OS setting |
+| `env` | `{}` | Child environment layered over the credential-scrubbed parent environment |
 | `disposeGraceMs` | `3000` | Grace between managed-range termination tiers |
 
-## Proxy
+## Permission
 
-The Qoder SDK does **not** discover a proxy from the inherited environment — `Options.proxy` documents that an omitted value makes the child "connect directly and does not discover a proxy from the inherited environment". So passing `HTTP_PROXY` to the parent process does not reach the child; the provider passes it explicitly.
+`permissionMode` accepts exactly what `qoderclicn` can be told on argv:
 
-Resolution order: `proxy` config → `HTTP(S)_PROXY`/`https_proxy`/`http_proxy` → operating-system setting → direct. On Windows the system setting is read from `HKCU\...\Internet Settings` (`ProxyEnable`/`ProxyServer`) and a bare `host:port` is normalized to `http://host:port`; a per-protocol list (`http=h:1;https=h:1`) is left alone rather than guessed, so set `proxy` explicitly in that case. macOS and Linux have no OS-level probe here — rely on the environment variables or `proxy`. Verified on this machine: with nothing configured and no env var, discovery yields `http://127.0.0.1:7897`; explicit config wins; `useSystemProxy: false` forces direct.
+| Value | Flags | Behavior |
+|---|---|---|
+| `yolo` **(default)** | `--yolo` | Full authority; nothing is surfaced or awaited |
+| `bypassPermissions` | `--permission-mode bypass_permissions` | Same effective authority as `yolo`, different spelling |
+| `acceptEdits` | `--permission-mode accept_edits` | Accept file edits; deny the rest |
+| `auto` | `--permission-mode auto` | Qoder's native classifier decides |
+| `dontAsk` | `--permission-mode dont_ask` | Deny anything not already authorized |
 
-A child that must not inherit a proxy uses `useSystemProxy: false` — the setting has no other "off" value, because an empty string is rejected by the schema.
+`plan` is deliberately **not** offered: the CLI's `--permission-mode` enum has no `plan` member, and this provider has no control channel to enter it.
 
-`permissionMode` values and their unattended behavior:
-
-| Value | Behavior |
-|---|---|
-| `yolo` **(default)** | Full authority: every operation runs with no permission gate and no human in the loop |
-| `dontAsk` | Deny anything not already authorized instead of prompting |
-| `acceptEdits` | Accept file edits; remaining permission prompts are denied by the unattended callback |
-| `auto` | Let Qoder's native classifier allow or deny permission requests |
-| `plan` | Run in planning mode, deny execution approval, return the plan as the final answer |
-| `bypassPermissions` | Same effective authority as `yolo`, different spelling |
-
-`yolo` and `bypassPermissions` are one mode on the Qoder side, not a ladder: the SDK maps `yolo` to the CLI's `--yolo` flag and deliberately suppresses `--dangerously-skip-permissions` for it (`allowDangerouslySkipPermissions && permissionMode !== "yolo"`), while both normalize to `bypass_permissions` on the control path. Both are treated as full-access here, which chiefly means **the deny-by-default `canUseTool` callback is not installed** — installing it would silently neutralize the mode.
-
-> **Understand the default before changing it.** This provider has no approval channel at all: `AskUserQuestion` is disallowed and no human can intervene mid-run. So the `yolo` default means an autonomous Qoder agent holds write and shell authority over the delegating Session's real workspace, driven by text a model composed. Nothing confines it here — dsh's sandbox backends (bwrap, Landlock, Seatbelt) are Linux/macOS, so on Windows there is no filesystem or process confinement around the child. Anything the child reads (a source file, a web page, a tool result) is an instruction-injection path straight into that authority. Set `permissionMode: acceptEdits`, `auto`, or `dontAsk` in the provider row to tighten it, or mount a second provider row with its own `toolName` so a low-privilege tool is the one the model reaches for by default.
-
-Credential-shaped ambient variables are removed before the `env` overlay, so a token intended for the child must be supplied via `authMode: env` or placed explicitly in `env`.
+> **Understand the default before changing it.** There is no approval channel here at all — a child runs unattended. So `yolo` means an autonomous Qoder agent holds write and shell authority over the delegating Session's real workspace, acting on text a model composed. dsh's sandbox backends (bwrap, Landlock, Seatbelt) are Linux/macOS, so on Windows nothing confines it. Anything the child reads is an instruction-injection path into that authority. Set `permissionMode: acceptEdits`, `auto`, or `dontAsk` to tighten it, or mount a second provider row with its own `toolName` so a low-privilege tool is the one reached by default.
 
 ## The delegation tool
 
-The Bundle's `cordis.patch.yml` inserts the model-facing row itself, so after installing there is nothing to compose — the tool is named `subagent_qoder`, and it accepts only `{ description, prompt, run_in_background }`. The model cannot choose the provider's model, permission mode, or workspace; those are fixed by the provider row. Each delegation row names one provider and needs its own `toolName`, which is why a second, differently-privileged instance is a second pair of rows rather than a call argument:
+The Bundle's `cordis.patch.yml` inserts the model-facing row itself, so after installing there is nothing to compose. The tool is `subagent_qoder` and it accepts only `{ description, prompt, run_in_background }` — the model cannot choose the child's model, permission mode, or workspace, because those are fixed by the provider row.
 
 ```yaml
-# Tighten the default, opt out, or add a second instance.
+# Optional overrides in the Profile's own cordis.patch.yml:
 - id: subagent-qoder
   config:
-    permissionMode: acceptEdits          # opt in to a tighter policy than `yolo`
+    permissionMode: acceptEdits
 
 - id: tool-subagent-qoder
-  disable: true                          # hide subagent_qoder from this Profile
-
-- insert:
-    - id: subagent-qoder-safe
-      name: 'dsh-subagent-qoder'
-      config:
-        providerName: qoder-safe
-        permissionMode: acceptEdits
-- insert:
-    - id: tool-subagent-qoder-safe
-      name: '@deepseek-ai/dsh-tool-subagent'
-      config:
-        provider: qoder-safe
-        toolName: subagent_qoder_safe
-        backgroundMode: one-shot
-        maxDepth: provider-managed
+  disable: true                     # hide subagent_qoder from this Profile
 ```
 
-The inserted row requires `@deepseek-ai/dsh-tool-subagent`, plus `@deepseek-ai/dsh-jobs-local` and `@deepseek-ai/dsh-tool-jobs` for `run_in_background`, to be in the Profile's closure. The `headless` and `web` templates already carry all three; a bare `dsh-base` Profile does not, which is why the installer initializes missing Profiles from `headless`.
+`maxDepth: provider-managed` on that row is **required**, not cosmetic: this provider advertises no `depthLimit` capability, and omitting it fails the whole Profile at boot with `tool-subagent: provider "qoder" cannot enforce maxDepth`. The assertion runs when the provider registers, so a unit-level `provider.start()` test cannot surface it — only a real boot.
 
-`maxDepth: provider-managed` is **required**, not cosmetic: this provider advertises no `depthLimit` capability, and omitting the field fails the whole Profile at boot with `tool-subagent: provider "qoder" cannot enforce maxDepth (no depthLimit capability)`. The check runs when the provider registers, so it is not visible to a unit-level `provider.start()` test — only to a real boot.
+## How a delegation runs
 
-A foreground call returns the final Qoder answer or an error with the stop reason and a safe diagnostic. A background call returns a parent-owned Job id for `job_output` / `job_kill`.
-
-**Background jobs do not notify a one-shot run.** Measured on the `headless` profile: with the session alive across multiple steps and a long generation, no completion notice arrived and no notice-driven turn was scheduled; and once the turn ended, `job_output <id>` returned `unknown job` with `job_list` empty, because the Jobs registry is per-process and exiting also tears the child down. So in a one-shot run either delegate in the foreground, or collect with `job_output` (`wait: true`) inside the same turn. Whether an interactive Web/desktop session receives the proactive notice was not tested here — do not assume it.
-
-## Authentication
-
-`query()` requires explicit auth for a direct session.
-
-- **Local reuse (default):** `authMode: qodercli` reuses an interactive `qodercli login` on the same machine, which is why the zero-config path works on a developer workstation. Not for shared infrastructure.
-- **Headless / CI:** set `authMode: env` and export a personal access token as `QODER_PERSONAL_ACCESS_TOKEN` (or a custom `authEnvVar`); the provider resolves it with `accessTokenFromEnv()`.
-
-## Transport and brand (important)
-
-The provider forces `transport: ProcessTransport.default` in `run.ts`. This is required for two reasons:
-
-1. dsh can only place the child under its subprocess owner through the SDK's `spawnQoderCLIProcess` hook, which fires **only** on the process transport. The SDK's installed default is the `worker` transport (runtime in a Node worker thread), where the hook never runs and dsh cannot terminate the child.
-2. The bundled worker runtime is the **global** brand (`qodercli`); on a machine logged in only to the **CN** CLI (`qoderclicn`), `qodercliAuth()` against that runtime fails with `No qodercli login found`. Routing through the process transport to the CN executable uses that executable's own native login.
-
-The provider therefore resolves a CLI executable itself — `QODER_CLI_PATH`, then `qoderclicn`/`qodercli` on `PATH`, then `~/.qoder-cn/bin/qoderclicn` and `~/.qoder/bin/qodercli`. Override with `pathToQoderCLIExecutable` when the CLI lives elsewhere; if nothing is found the provider logs the search order at Profile start rather than failing silently on the first delegation.
-
-A standalone smoke test in [`smoke/`](smoke/) exercises the Qoder-SDK path with no dsh packages: `cd smoke && npm install && QODER_CLI_PATH=<cli> node smoke.mjs`.
-
-## Build
-
-```sh
-pnpm install         # resolves @deepseek-ai/* peers from the dsh installation, and the Qoder SDK
-pnpm run build       # tsc -> lib/ (this bundle is consumed by the dsh profile)
 ```
+parent model tool_call(subagent_qoder {description, prompt})
+  → dsh-tool-subagent        builds SubagentStartRequest (prompt blocks, label, parent, signal)
+  → dsh-subagent             validates capabilities, resolves the descriptor
+  → QoderProvider.start()    resolveChildCwd() → spawn via ctx.subprocess
+  → qoderclicn --print --output-format stream-json --no-session-persistence --yolo
+                             task text written to stdin, stdin closed
+  ← JSONL: system/assistant/… ignored; only type:"result" is read
+  → SubagentResult { output:[{type:'text',…}], stopReason:'completed' }
+```
+
+Only a strict terminal result completes a run: `subtype === 'success'`, `is_error` false, and non-blank text. Anything else — a non-success subtype, no result before exit, a failed spawn — settles as `stopReason: 'error'` with a fixed-category diagnostic (`spawn` / `run` / `process` / `teardown`, capped at 4096 bytes). Cancellation arrives through the request's `AbortSignal`, which terminates the managed range and settles `aborted`.
+
+Because the task travels over stdin rather than argv, a long or quote-heavy delegation prompt cannot hit a command-line limit or need shell escaping.
+
+### Finding the CLI
+
+`QODER_CLI_PATH` → `qoderclicn`/`qodercli` on `PATH` → `~/.qoder-cn/bin/qoderclicn` → `~/.qoder/bin/qodercli`. Nothing found is logged at Profile start rather than failing silently on the first delegation. Set `pathToQoderCLIExecutable` when the executable lives elsewhere.
+
+### Authentication
+
+`qoderclicn` has no token flag, so authentication and account state are exactly the executable's own login — same contract as the Codex and Claude Code providers. On a shared or headless host, sign that executable in (`qoderclicn login`) or run the Profile as an account that already has a login; the provider never creates, stores, or rewrites credentials.
+
+### Proxy
+
+`proxy` is exported to the child as `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY`; with it omitted, inherited proxy variables win, then the Windows per-user system proxy from `HKCU\...\Internet Settings` (a bare `host:port` is normalized to `http://host:port`; a per-protocol list is left alone rather than guessed). `useSystemProxy: false` opts out. macOS and Linux have no OS-level probe — use `proxy` or the environment. Whether `qoderclicn` honors those variables is **unverified on this machine**, because its endpoints are directly reachable here; treat it as pass-through, not as a tested path.
+
+## Background jobs and completion notices
+
+`run_in_background: true` returns a parent-owned Job id; `job_output` retrieves the child's final text and `job_kill` cancels.
+
+**A one-shot run receives no completion notice.** Measured on the `headless` profile: with the session kept alive across several steps and a long generation, no notice arrived and no notice-driven turn was scheduled; and once the process exited, `job_output <id>` returned `unknown job` with `job_list` empty — the Jobs registry is per-process, and exiting tears the child down too. So in a one-shot run, delegate in the foreground or collect with `job_output` inside the same turn. Whether a persistent Web/desktop session receives the proactive notice was not tested — do not assume it.
 
 ## Known limitations
 
-Inherited from the one-shot SDK design, same as the Claude Code provider:
-
-- One fresh process, query, and turn per run — no continuation, resume, pooling, or progress stream.
-- Assistant payload is final text only; reasoning, intermediate messages, tool traffic, usage, stderr, and diffs stay product-local.
-- No human approval path — `AskUserQuestion` is disabled and permission prompts are denied (except under `bypassPermissions`); MCP elicitation is declined.
-- Authentication and account state remain native — the Bundle supplies the SDK/CLI but does not log in or rewrite Qoder settings.
-- No wall-clock timeout or side-effect rollback — cancel long work via the caller; files changed before cancellation are not restored.
-- The Qoder SDK is a fast-moving dependency (pinned `^1.0.45` here); verify `query()`/`Options`/result-shape compatibility after upgrading. The dsh side requires `@deepseek-ai/dsh-subagent >= 0.1.6-alpha.2` for the out-of-process helpers.
+- One fresh process, one turn, one result per run — no continuation, resume, pooling, or progress stream.
+- The task must be text blocks only; images and other block types are rejected.
+- Final assistant text only; reasoning, intermediate messages, tool traffic, usage, stderr, and diffs stay product-local.
+- No human approval path, by design; permission decisions are made by the mode above with no way to ask.
+- No `plan` mode (argv cannot express it) and no per-call model or permission choice.
+- Authentication and account state remain native to the executable.
+- No wall-clock timeout and no side-effect rollback — cancel long work; files changed before cancellation are not restored.
+- Requires the Profile closure to include `@deepseek-ai/dsh-tool-subagent` (plus the jobs packages for `run_in_background`).
 
 ## Source map
 
 | File | Role |
 |---|---|
-| `src/index.ts` | Plugin entry: config schema, auth resolution, provider registration |
-| `src/run.ts` | SDK query lifecycle, strict result acceptance, unattended permissions, failure taxonomy |
-| `src/process.ts` | `qodercli` spawn hook under the shared subprocess managed-range owner |
-| `cordis.patch.yml` | Profile layer that registers the dormant provider |
+| `src/index.ts` | Cordis plugin entry: config schema, CLI and proxy discovery, provider registration |
+| `src/run.ts` | One-shot lifecycle: spawn, stdin, strict result acceptance, cancellation, teardown, failure taxonomy |
+| `src/wire.ts` | Dependency-free protocol: argv construction, permission flags, JSONL line buffering, result parsing |
+| `cordis.patch.yml` | Profile layer registering the provider and inserting the delegation tool row |
+| `lib/` | Committed build output, so installs need no compile step |
+
+Rebuild after editing `src/`: `npm install --no-save @deepseek-ai/<peers>@alpha typescript @types/node && npm run build` (peers are `cordis`, `schemastery`, `dsh-brand`, `dsh-llm`, `dsh-session`, `dsh-subagent`, `dsh-subprocess`, `dsh-timeout`), then commit `lib/`.
 
 ## Verification record
 
-All of the following was run on a real machine (Windows, `dsh 0.1.6-alpha.2`, Qoder SDK 1.0.45 driving `qoderclicn 1.1.58`).
+Everything below ran on a real Windows machine with `dsh 0.1.6-alpha.2`, `qoderclicn 1.1.58`.
 
-| Step | Command / method | Result |
-|---|---|---|
-| SDK link only | `smoke/smoke.mjs` with `QODER_CLI_PATH` | `result: "QODER_OK"`, spawn hook fired once |
-| Real type build | `tsc -p tsconfig.json` against installed `@deepseek-ai/*@0.1.6-alpha.2` peer types | exit 0; emits `lib/*.js` + `lib/types/*.d.ts`; `./run.ts` specifiers rewritten to `./run.js` |
-| Bundle install | `dsh plugin --profile <p> add file:<checkout>` | installed; Qoder SDK postinstall fetched the win32-x64 worker runtime with checksum |
-| Patch composition | `dsh --profile <p> --dump-config` | provider row appears with provenance `# == dsh-subagent-qoder` |
-| Plugin contract | `import('dsh-subagent-qoder')` in the profile | `name=subagent-qoder`, `inject=["subagents","subprocess"]`, `apply`/`Config` present |
-| Delegation end-to-end | `provider.start()` with real `settleRunResult`/`subprocessRunHandle`/`resolveChildCwd` + a `SubprocessHandle` shim | `stopReason=completed`, `output=[{type:'text',text:'QODER_OK'}]`, `localAgent=undefined` |
-| **Full parent-model path** | `dsh --profile <p> --json "<ask it to call subagent_qoder>"` with the outbound proxy set | `tool_call tool=subagent_qoder` → `tool_result status=completed result="QODER_E2E_OK"` → `turn_end kind=completed`, `final="QODER_E2E_OK"`, 12608 in / 86 out tokens |
+| Step | Result |
+|---|---|
+| Wire protocol, no SDK | `--print --output-format stream-json` emitted `system/init`, `assistant`, then `result/success` with `is_error=false`, `result="WIRE_OK"` |
+| Permission semantics | `--yolo` created a file (verified on disk); `dont_ask` answered `denied` without hanging and created nothing |
+| Real type build | `tsc` exit 0 against installed `@deepseek-ai/*@0.1.6-alpha.2` peer types; emits `lib/*.js` + `lib/types/*.d.ts` |
+| One-command install | `dsh plugin --profile <p> add github:wengchengjian/dsh-subagent-qoder` → `Packages: +1`, joined `dsh.profile.bundles`, **no** build-script gate |
+| Patch composition | `--dump-config` shows the provider row plus `tool-subagent-qoder` with `toolName: subagent_qoder`, from an empty provider config |
+| Live delegation after the wire rewrite | `tool_call subagent_qoder` → `tool_result completed` → the child created `WIRE_RUN.txt`, bytes `WIRE_LIVE` confirmed on disk and re-read by the parent; `turn_end kind=completed` |
+| Version floor | `@deepseek-ai/dsh-subagent@0.1.5-rc.2` has no `out-of-process` module (`settleRunResult`, `subprocessRunHandle`, `resolveChildCwd`, `NO_START_CAPABILITIES`, `assertPositiveFinite`), so peers are pinned `>=0.1.6-alpha.2`. Note `@deepseek-ai/dsh-*` publish an old `0.0.1-rc.1` under `latest`; the usable train is the `alpha` dist-tag |
 
-The last row closes what a Profile boot cannot show: the `tool_call` event proves the delegation tool reached the parent model's tool list and the model chose to invoke it, and the `tool_result` is the child Qoder session's final text propagated back into the parent's answer.
+## Install gotchas, measured
 
-| Background / Job path | `subagent_qoder` with `run_in_background: true`, then `job_output` | first `tool_result` = `started background subagent job subagent-1`; then `job_output {job_id:"subagent-1", wait:true}` → `QODER_BG_OK\n[status: completed]`; `final = QODER_BG_OK` |
-
-`job_kill` was not exercised. Note also that the parent's own `thinking` events appear in the parent stream while the child's reasoning never does — the isolation direction is as designed.
-
-| `yolo` default grants write | Provider row with `permissionMode` **omitted**, delegation asked to create `YOLO_PROOF.txt` containing `WRITE_OK` | `tool_result` reported the path; **on disk** the file existed, 8 bytes, content `WRITE_OK` (the parent then re-read it with its own `read` tool). A restrictive default would have denied the write |
-| **One-command, zero-config** | `node scripts/dsh-install.mjs <new-profile>` only; provider row carries **no** config, so the CLI path is auto-discovered and `authMode` defaults to `qodercli` | `--dump-config` composed both rows from the Bundle patch; a delegation created `ONECLICK.txt` and the bytes (`ZERO_CONFIG`) were confirmed on disk |
-| Proxy discovery | `resolveProxy()` across five input combinations, plus a live delegation with `Options.proxy` set | no config/no env → `http://127.0.0.1:7897` from the registry; explicit wins; `host:port` normalized with scheme; `useSystemProxy: false` → direct; env beats OS. Child inference succeeded through the explicit proxy |
-| No background notice | `run_in_background: true` with the session kept alive for a 300-word generation, then a resumed session | no notice and no notice-driven turn in either case; after the first process exited, `job_output subagent-1` → `unknown job`, `job_list` → `(no background jobs)` |
-
-### Verified install gotchas
-
-1. **Requires `dsh >= 0.1.6-alpha.2`.** The `0.1.5-rc.x` line has no `out-of-process` module, so `settleRunResult`, `subprocessRunHandle`, `resolveChildCwd`, `NO_START_CAPABILITIES` and `assertPositiveFinite` are not exported and this provider cannot build. Note that `@deepseek-ai/dsh-*` publish under `latest` an old `0.0.1-rc.1`; the usable train is the `alpha` dist-tag.
-2. **pnpm blocks the Qoder SDK build script.** A bare `dsh plugin add` fails with `ERR_PNPM_IGNORED_BUILDS: @qoder-ai/qoder-agent-sdk`. `scripts/dsh-install.mjs` sets the allowance for you; by hand, add it to the Profile's `pnpm-workspace.yaml` (pnpm writes the placeholder to fill in) and re-run:
-   ```yaml
-   allowBuilds:
-     '@qoder-ai/qoder-agent-sdk': true
-   ```
-3. **Check the bundle stack after a failed install.** `dsh plugin add` reconciles `dsh.profile.bundles` on success, and a clean `file:` install does join it. But if the run fails partway (e.g. the build-script gate above), the dependency can land in `dependencies` without joining the bundle list — re-run the add after fixing, or add the name to `dsh.profile.bundles` yourself, then restart the Profile.
-4. **A missing Profile must come from a template that has the seam.** `dsh plugin add` on an unknown name initializes it with `dsh-base` alone, whose closure lacks `@deepseek-ai/dsh-tool-subagent`, so the Bundle's inserted tool row cannot resolve. The installer initializes from `headless` instead; installing into an existing `web`/`desktop`-style Profile needs no such care as long as that Profile already carries the seam.
-5. **The process transport needs a discoverable CLI.** The SDK's default package runtime is `Worker`, and its postinstall skips the bundled CLI binary ("Set `QODER_INSTALL_BUNDLED_CLI=1` to install the process fallback as well"). Discovery covers `QODER_CLI_PATH`, `PATH`, and the default `~/.qoder-cn/bin/qoderclicn` / `~/.qoder/bin/qodercli`; on a CN machine the discovered executable must be the **CN** one, because the global-brand worker reports `No qodercli login found`.
-
-### Deviation from the Claude Code provider
-
-`query()` in the Qoder SDK starts its transport **lazily**: nothing calls `spawnQoderCLIProcess` until the session is driven. `run.ts` therefore awaits `Query.initializationResult()` before requiring the managed child handle. Without this, publication fails with `SDK did not publish a controllable qodercli process`. The provider also adds `auth` (Qoder requires it for direct `query()` sessions) and omits the SDK-absent `onUserDialog` / `supportedDialogKinds` options.
-
-### Parent-model reachability
-
-Whether a delegation turn completes depends entirely on the parent side being able to reach its own configured provider — nothing this plugin controls. On the machine above, the globally active provider pointed at a host reachable only through a local HTTP proxy: a bare run stalled in step 1 with `inputTokens: 0` and `TIMEOUT`, while `HTTP_PROXY`/`HTTPS_PROXY` pointing at the proxy produced the successful turn recorded above. dsh resolves the outbound proxy from the launch environment before any entry mounts, so exporting those variables is enough; a provider whose endpoint is directly reachable needs no such setting.
-
-A stalled `step_end` with zero tokens is therefore a parent-model symptom, not a subagent failure — check the provider endpoint before suspecting this Bundle.
+1. **`allowBuilds` is no longer needed** — nothing in this Bundle has a build script. If an older checkout of this repo asked for it, that requirement is gone.
+2. **A bundle-stack miss follows a failed install.** `dsh plugin add` reconciles `dsh.profile.bundles` on success; if the run fails partway the dependency can land in `dependencies` without joining the list. Re-run, or add the name to `dsh.profile.bundles`, then restart.
+3. **A stalled `step_end` with zero tokens is a parent-provider symptom**, not a subagent failure: the delegating model could not reach its own provider. dsh resolves the outbound proxy from the launch environment, so exporting `HTTP_PROXY`/`HTTPS_PROXY` is the fix when the configured provider endpoint needs one.
